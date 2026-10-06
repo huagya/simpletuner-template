@@ -105,6 +105,11 @@ rm -rf /var/lib/apt/lists/* /var/cache/apt/* /workspace/.cache /tmp/*
 test ! -d /workspace/.cache/uv
 EOS
 
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends wget git git-lfs zip unzip \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY image/bin/ /opt/stt/bin/
 COPY image/stt-start /opt/stt/bin/stt-start
 COPY image/jupyter_server_config.py /opt/stt/share/jupyter_server_config.py
 COPY image/no-password/index.html /opt/stt/share/no-password/index.html
@@ -112,7 +117,10 @@ COPY image/pre_start.sh /pre_start.sh
 COPY image/post_start.sh /post_start.sh
 COPY image/start.sh /start.sh
 
-RUN chmod 755 /opt/stt/bin/stt-start /pre_start.sh /post_start.sh /start.sh
+RUN chmod 755 /opt/stt/bin/stt-start /opt/stt/bin/hf-model /opt/stt/bin/hf-dataset \
+      /opt/stt/bin/get-url /opt/stt/bin/git-clone-hf /opt/stt/bin/stt-help \
+      /opt/stt/bin/stt-doctor /opt/stt/bin/stt-redact.py \
+      /pre_start.sh /post_start.sh /start.sh
 
 # The CUDA image's entrypoint injects the host driver libraries, then execs
 # this command. A plain `docker run` on Windows uses the same path.

@@ -2,6 +2,75 @@
 
 Date: 2026-10-06. Nothing was published to a registry. No GPU was passed through. No RunPod or Vast instance was started. No git tag was pushed.
 
+## Step 4 — helper commands and self-diagnosis
+
+### 日本語（短い結論）
+
+- コンテナの PATH に `hf-model`、`hf-dataset`、`get-url`、`git-clone-hf`、`stt-help`、`stt-doctor` を入れた。ダウンロードの前に空き容量を見て、足りなければ日本語と英語で止める。ゲート付きリポジトリは `HF_TOKEN` が無い、または拒否されたとき、ライセンス同意の案内を出す。トークンそのものは出さない。
+- モデルは SimpleTuner が見る Hugging Face キャッシュ（`HF_HOME`、既定は `/workspace/huggingface`）に入る。`--to` を付けると `/workspace/models/NAME`。データセットは `/workspace/datasets`。
+- `stt-doctor` は GPU、ドライバ（CUDA 12.8 なので 570 以上）、torch、プロキシの 401/200、ディスク、メモリ、`/dev/shm`、HF トークンを見て、PASS / WARN / FAIL と日本語の直し方を出す。失敗したとき、または `--zip` のとき、秘密を伏せた診断 zip を `/workspace/diagnostics/` に書く。
+- GPU も Hugging Face への通信も使わないテストは、ホストでもコンテナの中でも `ALL HELPER TESTS PASSED`。CPU イメージのスモークは終了コード 0。
+- 最初のコンテナ内 `stt-doctor` は Jupyter が失敗した。`/` はパスワードを通すと 302 で `/lab` へ飛ぶ。認証ありの確認だけリダイレクトを追うように直して、再実行で S03 は PASS。
+
+### Decisions
+
+22. Helpers live in `image/bin` and are copied to `/opt/stt/bin`, which is already on `PATH`. They share `stt-lib.sh`. `wget`, `git`, `git-lfs`, `zip`, and `unzip` are installed in a layer after the venv, so the 2.89GB / 9.28GB venv layer stays cached. Added size of that apt layer is about 90MB (`apt` reported 89.5 MB).
+23. Disk preflight uses `hf download --dry-run --format agent` and the `totalling N` line (decimal K/M/G). The download needs that size plus 10% plus 1 MiB. `git-clone-hf` asks for about twice that, because git-lfs keeps a second copy in `.git`, and it says so before cloning. The clone URL never contains the token. When `HF_TOKEN` is set, git gets it only as `http.extraheader`.
+24. `get-url` sends `Authorization: Bearer` only when the host is `huggingface.co` or `www.huggingface.co`. Other hosts get a plain `wget -c`. A missing `Content-Length` is a failure. `--extract` handles zip, tar, and tar.gz.
+25. A 401/403 (or gated / unauthorized / forbidden text) from the dry-run or from a Hugging Face HEAD becomes the license hint in Japanese and English, plus the repo URL (`/datasets/` for datasets). A missing token and a denied token are different sentences. The token is not printed.
+26. `stt-doctor` does not run a GPU matmul and does not call huggingface.co unless `HF_TOKEN` is set (`hf auth whoami`) or `--model` is passed. Driver major ≥ 570 is PASS for CUDA 12.8. `/workspace` under 15 GiB is FAIL, under 50 GiB is WARN. RAM under 32 GiB is WARN. `/dev/shm` under 1 GiB is WARN (Docker Desktop's default is small). A FAIL exits 1. WARN does not. The zip is written on any FAIL and on `--zip`. The name is `stt-diag-<JST YYYYMMDD-HHMMSS>-<pid>.zip`. The authenticated proxy check follows redirects. Jupyter's `/` is a 302 to `/lab` after Caddy accepts the password; without that, S03 was FAIL even though the smoke script (which uses `curl -L`) was already PASS. The unauthenticated check does not follow redirects, so a 401 stays a 401.
+27. Redaction walks every staged file. Env values whose names match `TOKEN|KEY|SECRET|PASSWORD|PASS|AUTH|COOKIE` (length ≥ 6) and any `hf_[A-Za-z0-9]{20,}` become `***redacted(len=N)***`.
+28. Not in this step: `unpack`, `stt-logs`, `stt-restart`, `stt-disk`, the G03 256 MB matmul, L01 import scan, N01 (that would contact Hugging Face), and T01 log scan. `H02` exists only when `--model` is passed.
+
+### Verified without a GPU and without Hugging Face
+
+`bash scripts/test_helpers.sh` on the host, exit 0, last line `ALL HELPER TESTS PASSED`. Mocks stand in for `hf`, `wget`, `curl`, `git`, `df`, `nvidia-smi`, and `torch`. Seeded secrets: `HF_TOKEN=hf_FAKESECRETTOKENVALUE1234567890` and `WEB_PASSWORD=ci-password-123456`.
+
+| Check | Result |
+|---|---|
+| `hf-model` uses `HF_HOME` under the workspace and does not pass `--local-dir` | **PASS** |
+| `hf-model --to sigma` writes `/workspace/models/sigma` | **PASS** |
+| Short disk: non-zero exit, `空き容量が足りません`, no real download | **PASS** |
+| Gated 403 with no token: `HF_TOKEN がありません` and `ライセンスに同意`, plus the model URL | **PASS** |
+| Denied dataset token: `拒否されました`, dataset URL, token not in the output | **PASS** |
+| `hf-dataset` uses `--repo-type dataset` and `/workspace/datasets/captions` | **PASS** |
+| `get-url` adds the bearer header only for huggingface.co | **PASS** |
+| `git-clone-hf` warns about the 2× copy, recommends `hf-model`, URL has no token | **PASS** |
+| `stt-help` includes PixArt-alpha/PixArt-Sigma-XL-2-1024-MS, stabilityai/stable-cascade, and `stt-doctor` | **PASS** |
+| No GPU: G01 FAIL, G02 SKIP, exit non-zero, zip has `doctor.json` and `env.txt`, neither secret appears, redaction marker does | **PASS** |
+| Driver 550.54: G02 FAIL, hint mentions 570 or 12.8 | **PASS** |
+| Mock GPU + valid token: G01–G04, S01–S03, A01, H01 are PASS; device name Mock GPU; zip has no secrets | **PASS** |
+| Token containing DENIED: H01 FAIL, token not printed | **PASS** |
+
+The same script runs inside the container from `scripts/smoke_container.sh` (`STT_REQUIRE_IMAGE_BIN=1`, so the commands must be `/opt/stt/bin/...`). The live `stt-doctor --json --zip` in that smoke must have S01, S02, S03, and A01 as PASS. G01/G03 FAIL on this VM is expected (no GPU) and is not a smoke failure. The live zip is scanned for `WEB_PASSWORD`.
+
+### Container smoke (no GPU)
+
+`sudo STT_TORCH_VARIANT=cpu bash scripts/smoke_container.sh` exit 0. `image_bytes=3437823598` (the step-3 CPU image was 3,357,084,783; the added apt layer is wget, git, git-lfs, zip, and unzip). Last lines: `ALL HELPER TESTS PASSED`, `live {'S01': 'PASS', 'S02': 'PASS', 'S03': 'PASS', 'A01': 'PASS', 'G01': 'FAIL', 'G03': 'FAIL', 'M02': 'WARN'}`, `ALL CHECKS PASSED`.
+
+| Check | Result |
+|---|---|
+| CPU image builds, venv layer still cached | **PASS** |
+| Existing GUI / Jupyter / SSE / restart / missing-password checks | **PASS** |
+| Helper tests inside the container, secrets absent from the zip | **PASS** |
+| Live doctor S01 S02 S03 A01 | **PASS** |
+| Live doctor G01 and G03 | **FAIL**, expected here (no GPU). Not a smoke failure. |
+| Live `/dev/shm` | **WARN** (Docker's default shm on this VM). |
+| Live zip does not contain `WEB_PASSWORD` | **PASS** |
+| cu128 image rebuilt with the same scripts | **UNVERIFIED** this step. The COPY and apt layers are after the variant-specific venv, and the CPU smoke already executed those binaries. |
+| GitHub Actions pull-request job | Recorded below once that run finishes. It runs this same script and does not push. |
+
+### Failures
+
+1. First CPU smoke (`image_bytes=3437823513`, container `stt-smoke-cpu-48680`) reached `ALL HELPER TESTS PASSED` and then `S03=FAIL`. Host Jupyter checks had already passed because they use `curl -L`. Inside the container, `stt-doctor` recorded the 302 from `/` and treated it as a failed proxy. Fixed by following redirects only on the authenticated request. The rerun exited 0.
+
+### UNVERIFIED
+
+- A real download from Hugging Face, including a gated repo with a real token.
+- `stt-doctor` all PASS on a GPU host (driver ≥ 570, torch CUDA, VRAM).
+- `/dev/shm` on Windows Docker Desktop.
+- RunPod or Vast SSH, and a published image. No tag was pushed.
+
 ## Step 3 — smaller image and a CI build path
 
 ### 日本語（短い結論）

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Download a model into the Hugging Face cache SimpleTuner reads, or into
+# /workspace/models/NAME with --to.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=stt-lib.sh
+source "${HERE}/stt-lib.sh"
+
+usage() {
+  echo "使い方 / usage: hf-model <repo_id> [--file FILE] [--to NAME]" >&2
+}
+
+repo=""
+file=""
+to=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file)
+      [[ $# -ge 2 ]] || stt_die "--file の次にファイル名が必要です / --file needs a name"
+      file="$2"
+      shift 2
+      ;;
+    --to)
+      [[ $# -ge 2 ]] || stt_die "--to の次に名前が必要です / --to needs a name"
+      to="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      stt_die "不明な引数 / unknown option: $1"
+      ;;
+    *)
+      [[ -z "$repo" ]] || stt_die "repo id は一つだけです / only one repo id"
+      repo="$1"
+      shift
+      ;;
+  esac
+done
+[[ -n "$repo" ]] || { usage; exit 1; }
+stt_repo_ok "$repo"
+if [[ -n "$to" && ! "$to" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  stt_die "--to の名前が使えません / bad --to name"
+fi
+command -v hf >/dev/null || stt_die "hf コマンドがありません / hf command is not installed"
+
+export HF_HUB_DISABLE_TELEMETRY=1
+export HF_HOME="$(stt_hf_home)"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+mkdir -p "${HF_HOME}" "${HF_HUB_CACHE}"
+
+dest="$(stt_workspace)/models/${to}"
+if [[ -n "$to" ]]; then
+  mkdir -p "${dest}"
+fi
+
+args=(download "$repo" --format agent)
+if [[ -n "$file" ]]; then
+  args+=("$file")
+fi
+if [[ -n "$to" ]]; then
+  args+=(--local-dir "$dest")
+fi
+
+err="$(mktemp)"
+set +e
+hf "${args[@]}" --dry-run >"${err}.out" 2>"${err}"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  if stt_is_gated_text "$(cat "${err}" "${err}.out" 2>/dev/null || true)"; then
+    stt_gated_hint "$repo" model
+    rm -f "${err}" "${err}.out"
+    exit 1
+  fi
+  echo "hf download --dry-run が失敗しました / dry-run failed (exit ${status})" >&2
+  # Do not print the token if hf echoed it.
+  python3 - "${err}" "${err}.out" <<'PY' >&2 || true
+import os, pathlib, re, sys
+secrets = []
+for key, value in os.environ.items():
+    if re.search(r"TOKEN|KEY|SECRET|PASSWORD|PASS|AUTH|COOKIE", key, re.I) and value and len(value) >= 6:
+        secrets.append(value)
+secrets.sort(key=len, reverse=True)
+pat = re.compile(r"hf_[A-Za-z0-9]{20,}")
+for path in sys.argv[1:]:
+    text = pathlib.Path(path).read_text(errors="replace") if pathlib.Path(path).exists() else ""
+    for secret in secrets:
+        text = text.replace(secret, f"***redacted(len={len(secret)})***")
+    text = pat.sub("***redacted-hf-token***", text)
+    sys.stderr.write(text)
+PY
+  rm -f "${err}" "${err}.out"
+  exit 1
+fi
+
+size_text="$(sed -n 's/.*totalling \([^ ]*\)\./\1/p' "${err}.out" | head -n 1)"
+rm -f "${err}" "${err}.out"
+if [[ -z "$size_text" ]]; then
+  stt_die "ダウンロードサイズが分かりません / could not read the dry-run size"
+fi
+need="$(stt_parse_size "$size_text")" || stt_die "ダウンロードサイズが分かりません / could not parse size: ${size_text}"
+# Leave a little room for cache metadata.
+need=$(( need + need / 10 + 1048576 ))
+if [[ -n "$to" ]]; then
+  stt_require_space "${dest}" "${need}"
+else
+  stt_require_space "${HF_HOME}" "${need}"
+fi
+
+stt_say "ダウンロードを開始します / downloading ${repo} ($( [[ -n "$to" ]] && echo "$dest" || echo "$HF_HOME" ))"
+hf "${args[@]}"
+stt_say "完了 / done: ${repo}"

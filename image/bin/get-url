@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Resume a URL into a directory. Hugging Face URLs get the HF token.
+# Other hosts do not.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=stt-lib.sh
+source "${HERE}/stt-lib.sh"
+
+usage() {
+  echo "使い方 / usage: get-url <url> [dest_dir] [--extract]" >&2
+}
+
+url=""
+dest=""
+extract=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --extract)
+      extract=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      stt_die "不明な引数 / unknown option: $1"
+      ;;
+    *)
+      if [[ -z "$url" ]]; then
+        url="$1"
+      elif [[ -z "$dest" ]]; then
+        dest="$1"
+      else
+        stt_die "引数が多すぎます / too many arguments"
+      fi
+      shift
+      ;;
+  esac
+done
+[[ -n "$url" ]] || { usage; exit 1; }
+[[ "$url" =~ ^https?:// ]] || stt_die "http か https の URL だけ使えます / only http(s) URLs"
+if [[ -z "$dest" ]]; then
+  dest="$(stt_workspace)/datasets"
+fi
+mkdir -p "$dest"
+command -v wget >/dev/null || stt_die "wget がありません / wget is not installed"
+command -v curl >/dev/null || stt_die "curl がありません / curl is not installed"
+
+host="$(printf '%s' "$url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/@]+@)?([^/:]+).*#\2#' | tr '[:upper:]' '[:lower:]')"
+hf_host=0
+if [[ "$host" == "huggingface.co" || "$host" == "www.huggingface.co" ]]; then
+  hf_host=1
+fi
+
+header_args=()
+if [[ "$hf_host" -eq 1 && -n "${HF_TOKEN:-}" ]]; then
+  header_args=(--header "Authorization: Bearer ${HF_TOKEN}")
+fi
+
+headers="$(mktemp)"
+set +e
+if [[ ${#header_args[@]} -gt 0 ]]; then
+  curl -fsSI "${header_args[@]}" "$url" >"$headers" 2>"${headers}.err"
+else
+  curl -fsSI "$url" >"$headers" 2>"${headers}.err"
+fi
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  if [[ "$hf_host" -eq 1 ]] && stt_is_gated_text "$(cat "$headers" "${headers}.err" 2>/dev/null || true)"; then
+    repo="$(printf '%s' "$url" | sed -E 's#https?://([^/]+)/(datasets/)?([^/]+/[^/]+).*#\3#')"
+    kind=model
+    [[ "$url" == *"/datasets/"* ]] && kind=dataset
+    stt_gated_hint "$repo" "$kind"
+    rm -f "$headers" "${headers}.err"
+    exit 1
+  fi
+  if [[ "$hf_host" -eq 1 && -z "${HF_TOKEN:-}" ]] && stt_is_gated_text "$(cat "$headers" "${headers}.err" 2>/dev/null || true)"; then
+    stt_gated_hint "unknown/repo" model
+    rm -f "$headers" "${headers}.err"
+    exit 1
+  fi
+  echo "サイズを確認できません / could not read the URL headers (curl exit ${status})" >&2
+  rm -f "$headers" "${headers}.err"
+  exit 1
+fi
+length="$(awk 'tolower($1)=="content-length:" {print $2}' "$headers" | tr -d '\r' | tail -n 1)"
+rm -f "$headers" "${headers}.err"
+[[ "$length" =~ ^[0-9]+$ ]] || stt_die "ダウンロードサイズが分かりません / Content-Length was missing"
+need=$(( length + length / 10 + 1048576 ))
+stt_require_space "$dest" "$need"
+
+file_name="$(basename "${url%%\?*}")"
+[[ -n "$file_name" && "$file_name" != "/" ]] || file_name="download.bin"
+out="${dest}/${file_name}"
+stt_say "ダウンロードします / downloading ${url}"
+if [[ ${#header_args[@]} -gt 0 ]]; then
+  wget -c -O "$out" "${header_args[@]}" "$url"
+else
+  wget -c -O "$out" "$url"
+fi
+
+if [[ "$extract" -eq 1 ]]; then
+  case "$file_name" in
+    *.zip)
+      command -v unzip >/dev/null || stt_die "unzip がありません / unzip is not installed"
+      unzip -o "$out" -d "$dest"
+      ;;
+    *.tar.gz|*.tgz)
+      tar -xzf "$out" -C "$dest"
+      ;;
+    *.tar)
+      tar -xf "$out" -C "$dest"
+      ;;
+    *)
+      stt_die "--extract はこの拡張子に未対応です / --extract does not know ${file_name}"
+      ;;
+  esac
+  stt_say "展開しました / extracted into ${dest}"
+fi
+stt_say "完了 / done: ${out}"

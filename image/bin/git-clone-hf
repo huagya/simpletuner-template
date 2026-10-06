@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Clone a Hugging Face repo with git-lfs. Prefer hf-model: git-lfs keeps a
+# second copy inside .git.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=stt-lib.sh
+source "${HERE}/stt-lib.sh"
+
+usage() {
+  echo "使い方 / usage: git-clone-hf <repo_id> [dest]" >&2
+}
+
+repo=""
+dest=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      stt_die "不明な引数 / unknown option: $1"
+      ;;
+    *)
+      if [[ -z "$repo" ]]; then
+        repo="$1"
+      elif [[ -z "$dest" ]]; then
+        dest="$1"
+      else
+        stt_die "引数が多すぎます / too many arguments"
+      fi
+      shift
+      ;;
+  esac
+done
+[[ -n "$repo" ]] || { usage; exit 1; }
+stt_repo_ok "$repo"
+if [[ -z "$dest" ]]; then
+  dest="$(stt_workspace)/models/${repo##*/}"
+fi
+command -v git >/dev/null || stt_die "git がありません / git is not installed"
+command -v git-lfs >/dev/null || stt_die "git-lfs がありません / git-lfs is not installed"
+command -v hf >/dev/null || stt_die "hf コマンドがありません / hf command is not installed"
+
+echo "注意 / warning: git-lfs は .git の中にもう一コピーを残します。容量が約 2 倍になります。"
+echo "hf-model の方がおすすめです / hf-model is the better command. It does not keep that second copy."
+
+export HF_HUB_DISABLE_TELEMETRY=1
+export HF_HOME="$(stt_hf_home)"
+err="$(mktemp)"
+set +e
+hf download "$repo" --dry-run --format agent >"${err}.out" 2>"${err}"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  if stt_is_gated_text "$(cat "${err}" "${err}.out" 2>/dev/null || true)"; then
+    stt_gated_hint "$repo" model
+    rm -f "${err}" "${err}.out"
+    exit 1
+  fi
+  echo "サイズ確認に失敗しました / could not measure the repo (exit ${status})" >&2
+  rm -f "${err}" "${err}.out"
+  exit 1
+fi
+size_text="$(sed -n 's/.*totalling \([^ ]*\)\./\1/p' "${err}.out" | head -n 1)"
+rm -f "${err}" "${err}.out"
+[[ -n "$size_text" ]] || stt_die "ダウンロードサイズが分かりません / could not read the dry-run size"
+need="$(stt_parse_size "$size_text")" || stt_die "ダウンロードサイズが分かりません / could not parse size"
+# git-lfs stores the files twice.
+need=$(( need * 2 + need / 10 + 1048576 ))
+mkdir -p "$(dirname "$dest")"
+stt_require_space "$dest" "$need"
+
+clone_url="https://huggingface.co/${repo}"
+stt_say "git clone ${clone_url}"
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=http.extraheader
+  export GIT_CONFIG_VALUE_0="Authorization: Bearer ${HF_TOKEN}"
+fi
+git lfs install --skip-repo >/dev/null
+git clone "${clone_url}" "$dest"
+stt_say "完了 / done: ${dest}"

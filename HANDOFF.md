@@ -1,6 +1,111 @@
 # Handoff
 
-Date: 2026-10-06. Nothing was published to a registry. No GPU was passed through. No RunPod or Vast instance was started.
+Date: 2026-10-06. Nothing was published to a registry. No GPU was passed through. No RunPod or Vast instance was started. No git tag was pushed.
+
+## Step 3 — smaller image and a CI build path
+
+### 日本語（短い結論）
+
+- 30.8GB の正体は、RunPod ベース（12.7GB、中に CUDA の開発ツールと Nsight）と、その上の Python 環境 18.1GB。その 18.1GB のうち 8.6GB は、ベースイメージが `UV_CACHE_DIR` を `/workspace/.cache/uv` にしているせいでイメージに焼き付いた uv のキャッシュ。残りの 8.7GB が本体で、その中の 4.2GB は torch 用の `nvidia-*` ライブラリ。ベース側の CUDA と二重だった。
+- ベースを `nvidia/cuda:12.8.1-base-ubuntu24.04`（Docker Hub 上の圧縮サイズ約 101MB、イメージ内の `/usr/local/cuda-12.8` は 194MB）に変えた。cu128 イメージは 9.75GB、CPU 版は 3.36GB。GPU なしのスモークは両方とも成功。
+- RunPod のホストが `runpod/base` を持っていても得するのはそのベースの約 6.65GB（圧縮）だけ。以前のイメージは、その上に 18.1GB（非圧縮）の層が載っていた。新しいイメージ全体（9.75GB、非圧縮）の方が、その追加層より小さい。
+- GitHub Actions は `ubuntu-24.04`。公式の表は SSD 14GB。プルリクエストと手動実行は CPU 版をスモークして push しない。`v*` タグのときだけ cu128 をスモークして GHCR に push する。タグはまだ打っていない。
+
+### Where the 30.8GB went (before)
+
+`docker image inspect` Size of `stt-runpod:cu128` from step 2: **30,840,988,478** bytes. CPU smoke image: **18,063,304,171**. Base `runpod/base@sha256:e6eb5a38…`: **12,694,186,412**. Docker Hub `full_size` for that tag: **6,649,948,587** bytes (compressed registry size, 2026-10-06).
+
+`docker history` on the cu128 image, the layers we added:
+
+| Layer | Size |
+|---|---|
+| `uv pip sync` (the venv) | 18.1GB |
+| Caddy | 52MB |
+| both lock files | 890kB |
+
+`du` inside that container:
+
+| Path | Size | What it is |
+|---|---|---|
+| `/workspace/.cache/uv` | 8.6GB | uv download cache. `runpod/base` sets `UV_CACHE_DIR=/workspace/.cache/uv/`. The BuildKit mount was `/root/.cache/uv`, so uv never used it. gzip -6 of this directory: **4,611,997,469** bytes. |
+| `/opt/stt/venv` | 8.7GB | The install. 8.6 + 8.7 = 17.3GB, matching the 18.1GB layer. |
+| `site-packages/nvidia` | 4.2GB | pip wheels: cudnn 951MB, cublas 830MB, cusparselt 432MB, cusolver 387MB, nccl 383MB, cusparse 371MB, cufft 269MB, nvrtc 212MB, nvshmem 195MB, curand 133MB, nvjitlink 90MB, cupti 41MB. |
+| `site-packages/torch` | 1.6GB | `2.11.0+cu128` |
+| `site-packages/triton` | 640MB | Includes its own `ptxas`. |
+| `/usr/local/cuda-12.8` | 6.6GB | System CUDA from the base, including devel files under `targets/`. |
+| `/opt/nvidia/nsight-compute` | 1.2GB | Nsight, not used at training time. |
+| `/root` | 2.6MB | No pip cache left in the image. |
+
+`docker history` of the base itself (uncompressed layer sizes): cuda runtime libraries **3.11GB**, cuda devel (**cuda-libraries-dev**, nvcc, nsight package) **5.99GB**, cuDNN plus cuDNN dev **1.05GB**, the apt tool layer (compilers, ffmpeg dev, nginx, ssh, slurm, …) **1.51GB**, five Python versions **286MB**, the base's own pip stack including Jupyter **264MB**, uv binary **56.5MB**, Ubuntu rootfs **78.1MB**.
+
+`ldd` on the torch and `nvidia/*` libraries found `libcuda.so.1` missing (that comes from the host driver) and a handful of optional nvshmem transports (`libmpi`, `libfabric`, `libibverbs`). The devel toolkit is not required for those libraries to load. The CPU image's venv was **2.7GB** plus a **2.6GB** uv cache, which is the 5.32GB history layer.
+
+### Decision
+
+Use **`nvidia/cuda:12.8.1-base-ubuntu24.04`**, digest `sha256:e711c99333fdfe8ae1e677b4972be6c5021f0128a1d31f775c7e58d88921b6a9`.
+
+Docker Hub amd64 `size` for that tag: **100,999,123** bytes. Inside the built image, `du` of `/usr/local/cuda-12.8` is **194MB**. Compared bases, same API, same day, amd64 `size`:
+
+| Tag | Hub amd64 size |
+|---|---|
+| `nvidia/cuda:12.8.1-base-ubuntu24.04` | 100,999,123 |
+| `nvidia/cuda:12.8.1-runtime-ubuntu24.04` | 2,159,070,331 |
+| `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` | 2,862,565,896 |
+| `nvidia/cuda:12.8.1-devel-ubuntu24.04` | 5,161,997,061 |
+| `runpod/base:1.4.0-cuda1281-ubuntu2404` | 6,649,948,587 (`full_size`) |
+
+The runtime and devel tags would add the same libraries the torch wheel already vendors. The base tag is the driver-compat layer (`libcuda` comes from the host). Torch keeps the pip `nvidia-*` wheels. `UV_CACHE_DIR` is `/root/.cache/uv` on a BuildKit cache mount, and the layer deletes `/workspace/.cache`. `build-essential` is installed only so deepspeed's sdist can build, then purged in that same layer (`deepspeed` on disk is 11MB).
+
+RunPod conventions that `runpod/base` used to provide are in `image/start.sh`: `/pre_start.sh`, SSH only when `PUBLIC_KEY` is set (key auth, no password), `/etc/rp_environment`, `/post_start.sh`, then `sleep infinity`. nginx is not started. JupyterLab 4.5.10 is installed from `locks/jupyter.txt` into the venv and still sits behind Caddy on port 8888. `JUPYTER_PASSWORD` is not used, so nothing binds 8888 in the clear.
+
+A multi-stage copy off `runpod/base` was rejected. It would still download and unpack the 12.7GB base during the build, which is the disk problem on a free runner, and the final image would not share that base with other templates anyway.
+
+### RunPod layer-cache trade-off
+
+A host that already has `runpod/base@sha256:e6eb5a38…` skips the **6,649,948,587** byte registry blob. It still has to fetch every layer we add. That added layer was **18.1GB uncompressed**, and **4,611,997,469** bytes of that was the uv cache after gzip -6 (the 8.6GB directory). The new image is **9,747,387,413** bytes uncompressed in total, which is smaller than the old added layer alone, and its base blob is **100,999,123** bytes. Keeping `runpod/base` so some hosts can skip 6.65GB does not offset shipping an 18.1GB extra layer.
+
+### After
+
+| Image | `docker image inspect` Size | Largest added layer |
+|---|---|---|
+| step 2 cu128 | 30,840,988,478 | 18.1GB venv + uv cache |
+| step 3 cu128 | 9,747,387,413 | 9.28GB venv (torch + nvidia wheels + Jupyter) |
+| step 2 CPU | 18,063,304,171 | 5.32GB venv + uv cache |
+| step 3 CPU | 3,357,084,783 | 2.89GB venv |
+
+`/root/.cache` in the new cu128 image is 32KB. `/workspace/.cache` is absent. `build-info.json`: cu128 is `torch 2.11.0+cu128`, `torch_cuda 12.8`; CPU is `2.11.0+cpu`, `torch_cuda null`.
+
+gzip -6 of `/opt/stt/venv` in the new cu128 image: **4,675,746,836** bytes. That is the bulk of what a registry pull compresses. The old image's uv cache alone was already 4,611,997,469 bytes after the same gzip, before counting the venv.
+
+### CI
+
+GitHub's runner table lists **14 GB SSD** for `ubuntu-24.04` / `ubuntu-latest` (public repos, 4 CPU, 16 GB RAM): https://docs.github.com/en/actions/reference/runners/github-hosted-runners . That is the free path. Larger runners are paid. The workflow `.github/workflows/image.yml` deletes the preinstalled dotnet, Android SDK, GHC, Swift, and `AGENT_TOOLSDIRECTORY` before the build and prints `df -h` before and after, so the run log is the measurement for this repo. A published cleanup example measured an 84GB root that went from about 24GB free to about 43GB free after a similar deletion (https://github.com/ultralytics/actions/blob/main/cleanup-disk/README.md). That is their number, not ours, until this workflow runs.
+
+- `pull_request` and `workflow_dispatch`: CPU image, `scripts/smoke_container.sh`, no push.
+- `push` of a `v*` tag: cu128 image, smoke, then push `ghcr.io/huagya/simpletuner-template:<tag>` and `:latest`.
+
+No tag was created and nothing was pushed to GHCR.
+
+### Smoke (no GPU)
+
+| Check | CPU 3.36GB | cu128 9.75GB |
+|---|---|---|
+| Image builds, no pip at start | **PASS** | **PASS** |
+| GUI 401 / 200 | **PASS** | **PASS** |
+| Jupyter 401 / 200 | **PASS** | **PASS** |
+| SSE through the proxy | **PASS** | **PASS** |
+| Missing `WEB_PASSWORD` keeps the container up and hides the GUI | **PASS** | **PASS** |
+| Data dirs and server env under `/workspace` | **PASS** | **PASS** |
+| Restart keeps `/workspace` data | **PASS** | **PASS** |
+
+Commands: `sudo STT_TORCH_VARIANT=cpu bash scripts/smoke_container.sh` exit 0, `image_bytes=3357084783`. `sudo STT_TORCH_VARIANT=cu128 bash scripts/smoke_container.sh` exit 0, `image_bytes=9747387413`. Both printed `ALL CHECKS PASSED`.
+
+### UNVERIFIED
+
+- The GitHub Actions run itself, until the workflow on this branch finishes. See the dry-run note at the bottom of this section once it has been updated.
+- A real RunPod pull, warm or cold, and whether SSH accepts `PUBLIC_KEY` on their proxy. The script matches their key setup. It was not connected to RunPod.
+- GPU training. `libcuda.so.1` is still supplied by the host.
+- Windows Docker Desktop.
 
 ## Step 2 — the RunPod image boots
 

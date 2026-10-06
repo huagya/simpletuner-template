@@ -6,7 +6,7 @@ RunPod 向け（次に Vast.ai、その次に Windows の Docker Desktop）の S
 
 ## いま入っているもの
 
-- `Dockerfile` — `runpod/base:1.4.0-cuda1281-ubuntu2404`（digest 固定）の上に SimpleTuner 4.9.3 と torch を入れます。既定は `2.11.0+cu128`。起動時に pip は走りません。
+- `Dockerfile` — `nvidia/cuda:12.8.1-base-ubuntu24.04`（digest 固定）の上に SimpleTuner 4.9.3 と torch を入れます。既定は `2.11.0+cu128`。起動時に pip は走りません。SSH と `/start.sh` のフックはイメージ側で用意します。
 - `locks/` — ビルドに使う依存関係のロックファイル。
 - `image/` — 起動スクリプト、Caddy、パスワード未設定のときの案内ページ。
 - `docs/DESIGN.md` — 設計案。先頭に、調査で直した点を書いてあります。
@@ -55,7 +55,7 @@ sudo bash scripts/smoke_container.sh
 
 `smoke_container.sh` builds the CPU variant unless `STT_TORCH_VARIANT=cu128`.
 
-On 2026-10-06 the cu128 image was about 30.8GB and the CPU smoke image about 18.1GB (`docker image inspect` Size). The RunPod base layer alone is about 12.7GB, so a GitHub-hosted free runner (~14GB disk) cannot build either variant. Details are in `HANDOFF.md`.
+Image sizes and the GitHub Actions workflow (`.github/workflows/image.yml`) are in `HANDOFF.md`. A `v*` tag builds the cu128 image, runs the smoke test, and pushes to `ghcr.io/huagya/simpletuner-template`. Pull requests and manual runs build the CPU variant and do not push.
 
 ## License
 

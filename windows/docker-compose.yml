@@ -1,0 +1,44 @@
+# Windows Docker Desktop. start.bat is the way to launch this.
+# The image tag comes from versions.env (GHCR_IMAGE and IMAGE_TAG).
+# Until that tag exists on GHCR, start.bat builds the Dockerfile in the repo root.
+
+name: simpletuner
+
+services:
+  simpletuner:
+    image: ${GHCR_IMAGE:-ghcr.io/huagya/simpletuner-template}:${IMAGE_TAG:-v0.1.0}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        TORCH_VARIANT: ${TORCH_VARIANT:-cu128}
+    container_name: simpletuner-windows
+    # Compose rejects the string "all" and wants a device list. Same GPU request
+    # as deploy.resources below: every GPU, nvidia driver.
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Doctor warns when /dev/shm is under 1 GiB. Docker Desktop's default is 64 MB.
+    shm_size: "8gb"
+    ports:
+      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:8888:8888"
+    env_file:
+      - path: .env
+        required: true
+    volumes:
+      # Named volume: model cache, outputs, and logs stay inside WSL2 (fast).
+      - stt-data:/workspace
+      # This folder is the one to open in Explorer. It covers only datasets.
+      - ./datasets:/workspace/datasets
+
+volumes:
+  stt-data:

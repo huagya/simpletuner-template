@@ -47,6 +47,8 @@ docker run --gpus all -p 8001:8001 -p 8888:8888 \
 
 WebUI: `http://localhost:8001` (user `admin`). JupyterLab: `http://localhost:8888`. Both use that one password. On RunPod the start script prints the proxy URLs instead.
 
+Windows Docker Desktop: `windows/README.ja.md` と、同じフォルダの `start.bat`。イメージは `versions.env` の `GHCR_IMAGE` と `IMAGE_TAG` です。タグがまだ無いときは、その場でビルドします。
+
 Inside the container, `stt-help` prints the Japanese cheat sheet. `stt-doctor` checks the GPU, the proxy, disk, and the HF token, and writes a redacted zip under `/workspace/diagnostics/`.
 
 ## Checks

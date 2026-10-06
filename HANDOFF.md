@@ -2,6 +2,53 @@
 
 Date: 2026-10-06. Nothing was published to a registry. No GPU was passed through. No RunPod or Vast instance was started. No git tag was pushed.
 
+## Step 5 — Windows Docker Desktop launchers
+
+The pull request targets `cursor/helpers-doctor-2528` (PR #4), so the diff is only this step. After #4 merges, retarget it to `main`.
+
+### 日本語（短い結論）
+
+- `windows` フォルダに、ダブルクリック用の `start.bat`、`stop.bat`、`logs.bat`、`doctor.bat` を置いた。失敗すると「失敗」と「直し方」を出して、キーを押すまで閉じない。
+- 画面は `127.0.0.1:8001` と `8888` だけ。データは名前付きボリューム（WSL2 の中、速い）。画像を入れる場所だけ `windows\datasets` で、エクスプローラから置ける。
+- `/dev/shm` は 8GB。この Linux VM では doctor の M02 が PASS になった（以前の素の `docker run` は WARN）。
+- イメージ名は `ghcr.io/huagya/simpletuner-template:v0.1.0`（`versions.env`）。まだ公開していないので、取れなければその場でビルドする。
+- Windows の GPU と、実際のダブルクリックは、この VM では未確認。
+
+### Decisions
+
+29. Default storage is the named volume `stt-data` mounted on `/workspace`. A bind mount of `windows/datasets` covers only `/workspace/datasets`. Named volumes stay on the WSL2 ext4 disk, which is the faster place for the Hugging Face cache and checkpoints. The datasets folder is the Explorer drop path and does not depend on a `\\wsl$` location. Docker Desktop has used both `\\wsl$\docker-desktop-data\data\docker\volumes\` and `\\wsl$\docker-desktop\mnt\docker-desktop-disk\data\docker\volumes\`. The guide tells the user to open Jupyter for the volume, and gives a commented full bind mount (`C:\SimpleTuner:/workspace`) for people who want every file in Explorer and accept the slower cross-filesystem reads.
+30. `shm_size` is 8 GiB so `stt-doctor` M02 is not the Docker Desktop 64 MB warning. Ports are `127.0.0.1:8001` and `127.0.0.1:8888` only.
+31. Compose v2.32 rejects `gpus: all` as a string (`services.simpletuner.gpus must be a list`). The file requests every NVIDIA GPU twice, in the same shape: `gpus: [{driver: nvidia, count: all, capabilities: [gpu]}]` and `deploy.resources.reservations.devices`. `start.bat` still uses the CLI form `docker run --rm --gpus all ubuntu:24.04 nvidia-smi`. The pinned CUDA base image does not contain `nvidia-smi`. Docker Desktop's GPU support mounts the host binary into that container. The CUDA base tag was not used for the check.
+32. `start.bat` reads `GHCR_IMAGE` and `IMAGE_TAG` from `versions.env` (`ghcr.io/huagya/simpletuner-template` and `v0.1.0`). `docker pull` failure with no local image falls through to `docker compose build` (Dockerfile default `cu128`). An existing local image is reused when the registry tag is still missing. The first run writes `windows\.env` with an alphanumeric password of at least 12 characters, generated or typed. The password is not printed. The window pauses on success and on every failure.
+33. `windows/docker-compose.cpu.yml` drops the GPU keys with `!reset`. `start.bat` does not use it. It exists so this VM can boot the same file without a GPU.
+
+### Verified on this Linux VM (no GPU, no Windows)
+
+Compose: Docker Compose v2.32.4. `sudo docker compose -f windows/docker-compose.yml config` exit 0. With the CPU override, the rendered file has no `gpu` key, `shm_size: "8589934592"`, and both ports on `host_ip: 127.0.0.1`.
+
+`sudo TORCH_VARIANT=cpu docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build` exit 0. The venv layer was cached. The image was tagged `ghcr.io/huagya/simpletuner-template:v0.1.0`.
+
+| Check | Result |
+|---|---|
+| GUI 401 without a password, 200 with it, title SimpleTuner Training Studio | **PASS** (ready on the first poll after start) |
+| Jupyter 401 / 200 | **PASS** |
+| Published ports are `127.0.0.1` only | **PASS** (`docker port`) |
+| `/dev/shm` is 8192 MB and doctor M02 is PASS | **PASS** |
+| File written in `windows/datasets` is visible at `/workspace/datasets` | **PASS** |
+| Marker in the named volume survives `docker restart` | **PASS** |
+| Doctor S01 S02 S03 A01 after the GUI returns 200 | **PASS** |
+| Doctor G01 and G03 | **FAIL**, expected (no GPU) |
+| Doctor zip does not contain the test password | **PASS** (`stt-diag-20261007-001441-206.zip redacted`) |
+| `.bat` files are CRLF, contain `pause`, Japanese failure hints, and no `[[`, `$(`, or `#!/` | **PASS** (Python check, four files) |
+| Double-click on Windows, WSL2 detection, `nvidia-smi` inside Docker Desktop | **UNVERIFIED** |
+| A real pull of `v0.1.0` from GHCR | **UNVERIFIED** (tag not published; local build is the fallback) |
+
+The stack was removed with `docker compose down -v` after the checks. The test `.env` was not committed.
+
+### Actions run 37483916975
+
+PR #4, commit `acc6377`. `gh run view` conclusion: **success**. Job `smoke` passed in 4m31s. `Smoke the CPU image` succeeded. `Smoke the cu128 image` and `Push the version tag to GHCR` were skipped.
+
 ## Step 4 — helper commands and self-diagnosis
 
 ### 日本語（短い結論）
@@ -58,7 +105,7 @@ The same script runs inside the container from `scripts/smoke_container.sh` (`ST
 | Live `/dev/shm` | **WARN** (Docker's default shm on this VM). |
 | Live zip does not contain `WEB_PASSWORD` | **PASS** |
 | cu128 image rebuilt with the same scripts | **UNVERIFIED** this step. The COPY and apt layers are after the variant-specific venv, and the CPU smoke already executed those binaries. |
-| GitHub Actions pull-request job | Recorded below once that run finishes. It runs this same script and does not push. |
+| GitHub Actions pull-request job | **PASS**. Run [37483916975](https://github.com/huagya/simpletuner-template/actions/runs/37483916975) on `acc6377`, conclusion `success`. CPU smoke passed. cu128 smoke and the GHCR push were skipped. |
 
 ### Failures
 

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Short Japanese cheat sheet. English is on the same lines.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=stt-lib.sh
+source "${HERE}/stt-lib.sh"
+
+ws="$(stt_workspace)"
+gui_port="${STT_GUI_PORT:-8001}"
+jup_port="${STT_JUPYTER_PORT:-8888}"
+if [[ -n "${RUNPOD_POD_ID:-}" ]]; then
+  gui_url="https://${RUNPOD_POD_ID}-${gui_port}.proxy.runpod.net"
+  jup_url="https://${RUNPOD_POD_ID}-${jup_port}.proxy.runpod.net"
+else
+  gui_url="${STT_GUI_URL:-http://localhost:${gui_port}}"
+  jup_url="${STT_JUPYTER_URL:-http://localhost:${jup_port}}"
+fi
+
+cat <<EOF
+SimpleTuner テンプレートのコマンド / commands
+ユーザー名は ${WEB_USERNAME:-admin}。パスワードは WEB_PASSWORD（12 文字以上）です。
+Login user is ${WEB_USERNAME:-admin}. The password is WEB_PASSWORD (12+ characters).
+
+画面 / WebUI : ${gui_url}
+Jupyter      : ${jup_url}
+データ / data: ${ws}
+  モデルキャッシュ / model cache : ${ws}/huggingface   (HF_HOME)
+  データセット / datasets        : ${ws}/datasets
+  学習結果 / outputs             : ${ws}/simpletuner/output
+
+困ったら / if something is wrong:
+  stt-doctor
+
+モデルを先に落とす / download a model into the cache SimpleTuner uses:
+  hf-model PixArt-alpha/PixArt-Sigma-XL-2-1024-MS
+  hf-model stabilityai/stable-cascade
+
+データセット / a dataset, saved under ${ws}/datasets:
+  hf-dataset org/my-captions pixart-samples
+
+URL / a file (Hugging Face URLs send HF_TOKEN; other sites do not):
+  get-url https://example.com/images.zip ${ws}/datasets --extract
+
+git（容量が約 2 倍になるので hf-model を推奨）/ git, which stores a second copy:
+  git-clone-hf PixArt-alpha/PixArt-Sigma-XL-2-1024-MS
+
+ゲート付きモデル / gated models:
+  モデルのページでライセンスに同意してから、HF_TOKEN を設定して再実行します。
+  Accept the license on the model page, set HF_TOKEN, and run the command again.
+  トークンは画面に出ません / the token is never printed.
+EOF

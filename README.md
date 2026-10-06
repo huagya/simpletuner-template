@@ -13,7 +13,8 @@ RunPod 向け（次に Vast.ai、その次に Windows の Docker Desktop）の S
 - `HANDOFF.md` — 決めたこと、確認できた事実、未確認、失敗。
 - `versions.env` — 固定するバージョン。
 - `scripts/feasibility_proxy_test.sh` — GPU なしで WebUI とプロキシだけを試します。
-- `scripts/smoke_container.sh` — イメージをビルドして、パスワード、Jupyter、SSE、データフォルダ、再起動を確認します。失敗すると終了コードが 0 以外になります。
+- `scripts/smoke_container.sh` — イメージをビルドして、パスワード、Jupyter、SSE、データフォルダ、再起動、ヘルパーのテストを確認します。失敗すると終了コードが 0 以外になります。
+- `image/bin/` — コンテナの PATH にあるコマンド。`stt-help`（日本語の早見表）、`hf-model`、`hf-dataset`、`get-url`、`git-clone-hf`、`stt-doctor`（自己診断と、秘密を伏せた zip）。
 
 ## What this is
 
@@ -45,6 +46,8 @@ docker run --gpus all -p 8001:8001 -p 8888:8888 \
 ```
 
 WebUI: `http://localhost:8001` (user `admin`). JupyterLab: `http://localhost:8888`. Both use that one password. On RunPod the start script prints the proxy URLs instead.
+
+Inside the container, `stt-help` prints the Japanese cheat sheet. `stt-doctor` checks the GPU, the proxy, disk, and the HF token, and writes a redacted zip under `/workspace/diagnostics/`.
 
 ## Checks
 

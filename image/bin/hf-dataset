@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Download a dataset into /workspace/datasets/NAME.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=stt-lib.sh
+source "${HERE}/stt-lib.sh"
+
+usage() {
+  echo "使い方 / usage: hf-dataset <repo_id> [NAME] [--include PATTERN]" >&2
+}
+
+repo=""
+name=""
+include=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --include)
+      [[ $# -ge 2 ]] || stt_die "--include の次にパターンが必要です / --include needs a pattern"
+      include="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      stt_die "不明な引数 / unknown option: $1"
+      ;;
+    *)
+      if [[ -z "$repo" ]]; then
+        repo="$1"
+      elif [[ -z "$name" ]]; then
+        name="$1"
+      else
+        stt_die "引数が多すぎます / too many arguments"
+      fi
+      shift
+      ;;
+  esac
+done
+[[ -n "$repo" ]] || { usage; exit 1; }
+stt_repo_ok "$repo"
+if [[ -z "$name" ]]; then
+  name="${repo##*/}"
+fi
+[[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || stt_die "保存名が使えません / bad dataset name"
+command -v hf >/dev/null || stt_die "hf コマンドがありません / hf command is not installed"
+
+export HF_HUB_DISABLE_TELEMETRY=1
+export HF_HOME="$(stt_hf_home)"
+mkdir -p "${HF_HOME}"
+dest="$(stt_workspace)/datasets/${name}"
+mkdir -p "${dest}"
+
+args=(download "$repo" --repo-type dataset --local-dir "$dest" --format agent)
+if [[ -n "$include" ]]; then
+  args+=(--include "$include")
+fi
+
+err="$(mktemp)"
+set +e
+hf "${args[@]}" --dry-run >"${err}.out" 2>"${err}"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  if stt_is_gated_text "$(cat "${err}" "${err}.out" 2>/dev/null || true)"; then
+    stt_gated_hint "$repo" dataset
+    rm -f "${err}" "${err}.out"
+    exit 1
+  fi
+  echo "hf download --dry-run が失敗しました / dry-run failed (exit ${status})" >&2
+  rm -f "${err}" "${err}.out"
+  exit 1
+fi
+size_text="$(sed -n 's/.*totalling \([^ ]*\)\./\1/p' "${err}.out" | head -n 1)"
+rm -f "${err}" "${err}.out"
+[[ -n "$size_text" ]] || stt_die "ダウンロードサイズが分かりません / could not read the dry-run size"
+need="$(stt_parse_size "$size_text")" || stt_die "ダウンロードサイズが分かりません / could not parse size: ${size_text}"
+need=$(( need + need / 10 + 1048576 ))
+stt_require_space "${dest}" "${need}"
+
+stt_say "データセットを保存します / saving dataset ${repo} to ${dest}"
+hf "${args[@]}"
+stt_say "完了 / done: ${dest}"

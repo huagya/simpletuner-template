@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# Health check. Prints PASS/WARN/FAIL. Writes a redacted zip when something
+# fails, or when --zip is given.
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=stt-lib.sh
+source "${HERE}/stt-lib.sh"
+
+want_json=0
+want_zip=0
+model_repo=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) want_json=1; shift ;;
+    --zip) want_zip=1; shift ;;
+    --model)
+      [[ $# -ge 2 ]] || stt_die "--model の次に repo id が必要です / --model needs a repo id"
+      model_repo="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "使い方 / usage: stt-doctor [--json] [--zip] [--model REPO]" >&2
+      exit 0
+      ;;
+    *) stt_die "不明な引数 / unknown option: $1" ;;
+  esac
+done
+
+ws="$(stt_workspace)"
+gui_port="${STT_GUI_PORT:-8001}"
+jup_port="${STT_JUPYTER_PORT:-8888}"
+app_port="${STT_APP_PORT:-18001}"
+user_name="${WEB_USERNAME:-admin}"
+rows="$(mktemp)"
+fail_count=0
+warn_count=0
+
+add() {
+  local id="$1" status="$2" message="$3" hint="$4"
+  printf '%s\t%s\t%s\t%s\n' "$id" "$status" "$message" "$hint" >>"$rows"
+  if [[ "$status" == "FAIL" ]]; then
+    fail_count=$((fail_count + 1))
+  elif [[ "$status" == "WARN" ]]; then
+    warn_count=$((warn_count + 1))
+  fi
+}
+
+# P01 image identity
+if [[ -f /opt/stt/build-info.json ]]; then
+  add P01 PASS "イメージ情報 / build-info: $(tr '\n' ' ' </opt/stt/build-info.json)" ""
+else
+  add P01 WARN "build-info.json がありません / build-info.json is missing" "イメージを作り直してください / rebuild the image"
+fi
+
+# G01 GPU listed
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  add G01 FAIL "nvidia-smi がありません。GPU が見えません / nvidia-smi is missing, no GPU is visible" "GPU 付きのインスタンスか確認してください / use a GPU instance"
+  add G02 SKIP "ドライバを確認できません / driver was not checked" ""
+  add G04 SKIP "VRAM を確認できません / VRAM was not checked" ""
+elif ! nvidia-smi -L >/dev/null 2>&1; then
+  add G01 FAIL "GPU が見えません / no GPU is visible" "GPU 付きのインスタンスか確認してください / use a GPU instance"
+  add G02 SKIP "ドライバを確認できません / driver was not checked" ""
+  add G04 SKIP "VRAM を確認できません / VRAM was not checked" ""
+else
+  gpu_line="$(nvidia-smi -L 2>/dev/null | head -n 1)"
+  add G01 PASS "GPU が見えます / GPU visible: ${gpu_line}" ""
+  driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' ')"
+  major="${driver%%.*}"
+  if [[ "$major" =~ ^[0-9]+$ && "$major" -ge 570 ]]; then
+    add G02 PASS "ドライバ ${driver} は CUDA 12.8 の要件（570 以上）を満たします / driver ${driver} is new enough for CUDA 12.8" ""
+  elif [[ "$major" =~ ^[0-9]+$ ]]; then
+    add G02 FAIL "ドライバ ${driver} は 570 未満です / driver ${driver} is older than 570" "CUDA 12.8 以上のホストを選んでください（RunPod/Vast のフィルタ） / pick a host with CUDA 12.8+"
+  else
+    add G02 FAIL "ドライバのバージョンが読めません / could not read the driver version" "nvidia-smi の出力を確認してください / check nvidia-smi"
+  fi
+  mem_line="$(nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 || true)"
+  free_mib="${mem_line%%,*}"
+  total_mib="${mem_line##*,}"
+  free_mib="$(echo "$free_mib" | tr -d ' ')"
+  total_mib="$(echo "$total_mib" | tr -d ' ')"
+  if [[ "$free_mib" =~ ^[0-9]+$ && "$total_mib" =~ ^[0-9]+$ && "$total_mib" -gt 0 ]]; then
+    # Integer percent.
+    pct=$(( free_mib * 100 / total_mib ))
+    if (( pct < 90 )); then
+      add G04 WARN "空き VRAM が ${pct}% です / only ${pct}% of VRAM is free" "他のプロセスが GPU を使っていないか確認してください / check other GPU processes"
+    else
+      add G04 PASS "空き VRAM ${free_mib} / ${total_mib} MiB" ""
+    fi
+  else
+    add G04 WARN "VRAM の数値が読めません / could not read VRAM numbers" ""
+  fi
+fi
+
+# G03 torch
+torch_json="$(python3 - <<'PY' 2>/dev/null || true
+import json
+info = {"ok": False, "cuda": False, "version": None, "cuda_ver": None, "name": None, "vram": None, "error": None}
+try:
+    import torch
+    info["ok"] = True
+    info["version"] = torch.__version__
+    info["cuda_ver"] = getattr(torch.version, "cuda", None)
+    info["cuda"] = bool(torch.cuda.is_available())
+    if info["cuda"]:
+        info["name"] = torch.cuda.get_device_name(0)
+        info["vram"] = int(torch.cuda.get_device_properties(0).total_memory)
+except Exception as exc:
+    info["error"] = str(exc)
+print(json.dumps(info))
+PY
+)"
+if [[ -z "$torch_json" ]]; then
+  add G03 FAIL "torch を読み込めません / torch did not import" "イメージの Python を確認してください / check the image Python"
+else
+  g03="$(python3 - "$torch_json" <<'PY'
+import json, sys
+info = json.loads(sys.argv[1])
+if not info.get("ok"):
+    print("FAIL\ttorch を読み込めません / torch did not import\t" + (info.get("error") or ""))
+elif not info.get("cuda"):
+    print("FAIL\tPyTorch から GPU が見えません / torch.cuda.is_available() is false\tGPU 付きで起動しているか、ドライバが 570 以上か確認してください / check the GPU and a driver >= 570")
+else:
+    name = info.get("name") or "GPU"
+    vram = info.get("vram") or 0
+    gib = vram / (1024 ** 3)
+    print(f"PASS\t{name} / VRAM {gib:.1f} GiB / torch {info.get('version')} cuda {info.get('cuda_ver')}\t")
+PY
+)"
+  add G03 "${g03%%$'\t'*}" "$(printf '%s' "$g03" | cut -f2)" "$(printf '%s' "$g03" | cut -f3)"
+fi
+
+# S01 local server
+code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${app_port}/web/trainer" || true)"
+if [[ "$code" == "200" ]]; then
+  add S01 PASS "SimpleTuner は 127.0.0.1:${app_port} で応答しています / SimpleTuner answered" ""
+else
+  add S01 FAIL "SimpleTuner が応答しません (HTTP ${code:-none}) / SimpleTuner did not answer" "ログの末尾を確認してください / see the end of simpletuner.log"
+fi
+
+# S02 and S03 proxy auth
+check_proxy() {
+  local id="$1" port="$2" label="$3" path="$4"
+  local unauth auth
+  unauth="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}${path}" || true)"
+  if [[ -n "${WEB_PASSWORD:-}" ]]; then
+    auth="$(curl -s -o /dev/null -u "${user_name}:${WEB_PASSWORD}" -w '%{http_code}' "http://127.0.0.1:${port}${path}" || true)"
+  else
+    auth="skip"
+  fi
+  if [[ "$unauth" == "200" ]]; then
+    add "$id" FAIL "${label} がパスワードなしで開きます / ${label} returned 200 without a password" "WEB_PASSWORD を設定して Caddy を通し、アプリを直接公開しないでください / put the app behind Caddy"
+  elif [[ "$unauth" == "401" && "$auth" == "200" ]]; then
+    add "$id" PASS "${label}: パスワードなしは 401、ありは 200 / 401 without the password, 200 with it" ""
+  else
+    add "$id" FAIL "${label}: パスワードなし ${unauth:-none}、あり ${auth:-none} / unexpected proxy status" "stt-start のログを確認してください / check the start log"
+  fi
+}
+check_proxy S02 "$gui_port" "WebUI" "/web/trainer"
+check_proxy S03 "$jup_port" "Jupyter" "/"
+
+# A01 password
+if [[ "${JUPYTER_DISABLE_AUTH:-}" == "true" ]]; then
+  add A01 FAIL "JUPYTER_DISABLE_AUTH=true です / Jupyter auth is disabled" "この変数は外してください。パスワードは WEB_PASSWORD です / unset it and use WEB_PASSWORD"
+elif [[ -z "${WEB_PASSWORD:-}" ]]; then
+  add A01 FAIL "WEB_PASSWORD がありません / WEB_PASSWORD is unset" "12 文字以上の WEB_PASSWORD を設定してください / set WEB_PASSWORD to 12+ characters"
+elif [[ "${#WEB_PASSWORD}" -lt 12 ]]; then
+  add A01 FAIL "WEB_PASSWORD が短すぎます / WEB_PASSWORD is shorter than 12 characters" "12 文字以上にしてください / use 12 or more characters"
+else
+  add A01 PASS "WEB_PASSWORD は設定されています（${#WEB_PASSWORD} 文字、値は表示しません） / password is set, value not shown" ""
+fi
+
+# D01 persistence
+ws_dev="$(df -P "$ws" 2>/dev/null | awk 'NR==2 {print $1}')"
+root_dev="$(df -P / 2>/dev/null | awk 'NR==2 {print $1}')"
+if [[ -n "$ws_dev" && "$ws_dev" == "$root_dev" ]]; then
+  add D01 WARN "/workspace がコンテナと同じディスクです / /workspace is on the container disk" "ここに保存したものは停止で消える可能性があります / data may vanish when the container stops. Mount a volume on /workspace"
+else
+  add D01 PASS "/workspace は別のディスクです / /workspace is a separate mount (${ws_dev:-unknown})" ""
+fi
+
+# D02 free space
+free_b="$(stt_free_bytes "$ws" || true)"
+if [[ "$free_b" =~ ^[0-9]+$ ]]; then
+  gib=$(( free_b / 1024 / 1024 / 1024 ))
+  if (( free_b < 15 * 1024 * 1024 * 1024 )); then
+    add D02 FAIL "/workspace の空きが ${gib} GiB です / only ${gib} GiB free on /workspace" "出力や古いモデルを消してください / delete old outputs or models"
+  elif (( free_b < 50 * 1024 * 1024 * 1024 )); then
+    add D02 WARN "/workspace の空きが ${gib} GiB です / ${gib} GiB free on /workspace" "大きなモデルの前に空きを増やしてください / free space before a large model"
+  else
+    add D02 PASS "/workspace の空き ${gib} GiB / ${gib} GiB free" ""
+  fi
+else
+  add D02 FAIL "/workspace の空き容量が読めません / could not read free space" "ディスクを確認してください / check the disk"
+fi
+
+# M01 RAM
+mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+  mem_gb=$(( mem_kb / 1024 / 1024 ))
+  if (( mem_kb < 32 * 1024 * 1024 )); then
+    add M01 WARN "メモリは約 ${mem_gb} GiB です / about ${mem_gb} GiB of RAM" "大きいモデルには 32 GiB 以上が安心です / 32 GiB is safer for large models"
+  else
+    add M01 PASS "メモリは約 ${mem_gb} GiB です / about ${mem_gb} GiB of RAM" ""
+  fi
+else
+  add M01 WARN "メモリ容量が読めません / could not read RAM" ""
+fi
+oom=0
+for ev in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.oom_kill; do
+  if [[ -f "$ev" ]]; then
+    n="$(awk '/oom_kill/ {print $2}' "$ev" 2>/dev/null | head -n 1 || true)"
+    if [[ "$n" =~ ^[0-9]+$ && "$n" -gt "$oom" ]]; then
+      oom="$n"
+    fi
+  fi
+done
+if (( oom > 0 )); then
+  add M01 FAIL "メモリ不足で強制終了された履歴があります / the cgroup oom_kill count is ${oom}" "バッチサイズを下げるか、メモリの多いマシンにしてください / lower the batch size or use more RAM"
+fi
+
+# M02 shm
+shm="$(df -B1 --output=size /dev/shm 2>/dev/null | awk 'NR==2 {print $1}' || true)"
+if [[ "$shm" =~ ^[0-9]+$ ]]; then
+  shm_mb=$(( shm / 1024 / 1024 ))
+  if (( shm < 1024 * 1024 * 1024 )); then
+    add M02 WARN "/dev/shm は ${shm_mb} MB です / /dev/shm is ${shm_mb} MB" "Docker Desktop の初期値は小さいです。compose で shm_size を 8gb 以上にしてください / set shm_size to at least 8gb"
+  else
+    add M02 PASS "/dev/shm は ${shm_mb} MB です / /dev/shm is ${shm_mb} MB" ""
+  fi
+else
+  add M02 WARN "/dev/shm のサイズが読めません / could not read /dev/shm" ""
+fi
+
+# H01 token
+if [[ -z "${HF_TOKEN:-}" ]]; then
+  add H01 WARN "HF_TOKEN は未設定です（値は表示しません） / HF_TOKEN is unset" "ゲート付きモデルだけ必要です / only gated or private models need it"
+else
+  err="$(mktemp)"
+  set +e
+  hf auth whoami >"${err}.out" 2>"${err}"
+  who=$?
+  set -e
+  if [[ "$who" -eq 0 ]]; then
+    add H01 PASS "HF_TOKEN は有効です（${#HF_TOKEN} 文字、値は表示しません） / token is valid, value not shown" ""
+  else
+    if stt_is_gated_text "$(cat "${err}" "${err}.out" 2>/dev/null || true)"; then
+      add H01 FAIL "HF_TOKEN が拒否されました（値は表示しません） / HF_TOKEN was denied, value not shown" "トークンを作り直し、ゲート付きモデルのライセンスに同意してください / create a new token and accept the license"
+    else
+      add H01 FAIL "HF_TOKEN の確認に失敗しました（値は表示しません） / could not validate HF_TOKEN" "ネットワークとトークンを確認してください / check the network and the token"
+    fi
+  fi
+  rm -f "${err}" "${err}.out"
+fi
+
+# H02 optional model probe
+if [[ -n "$model_repo" ]]; then
+  stt_repo_ok "$model_repo"
+  err="$(mktemp)"
+  set +e
+  hf download "$model_repo" --dry-run --format agent >"${err}.out" 2>"${err}"
+  status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    add H02 PASS "${model_repo} にアクセスできます / the repo is reachable" ""
+  elif stt_is_gated_text "$(cat "${err}" "${err}.out" 2>/dev/null || true)"; then
+    add H02 FAIL "${model_repo} はゲートで拒否されました / gated access was denied" "Hugging Face のページでライセンスに同意し、HF_TOKEN を設定してください / accept the license and set HF_TOKEN. https://huggingface.co/${model_repo}"
+  else
+    add H02 FAIL "${model_repo} の確認に失敗しました / the repo check failed" "repo id とネットワークを確認してください / check the repo id and the network"
+  fi
+  rm -f "${err}" "${err}.out"
+fi
+
+print_human() {
+  while IFS=$'\t' read -r id status message hint; do
+    printf '%-4s %-4s %s\n' "$id" "$status" "$message"
+    if [[ -n "$hint" && "$status" != "PASS" && "$status" != "SKIP" ]]; then
+      printf '         %s\n' "$hint"
+    fi
+  done <"$rows"
+}
+
+write_json() {
+  python3 - "$rows" <<'PY'
+import json, sys
+rows = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    parts = line.rstrip("\n").split("\t")
+    while len(parts) < 4:
+        parts.append("")
+    rows.append({"id": parts[0], "status": parts[1], "message": parts[2], "hint": parts[3]})
+print(json.dumps({"checks": rows}, ensure_ascii=False, indent=2))
+PY
+}
+
+if [[ "$want_json" -eq 1 ]]; then
+  write_json
+else
+  print_human
+fi
+
+if [[ "$want_zip" -eq 1 || "$fail_count" -gt 0 ]]; then
+  stage="$(mktemp -d)"
+  mkdir -p "${ws}/diagnostics" "${ws}/logs"
+  print_human >"${stage}/doctor.txt"
+  write_json >"${stage}/doctor.json"
+  if [[ -f /opt/stt/build-info.json ]]; then
+    cp /opt/stt/build-info.json "${stage}/build-info.json"
+  fi
+  if [[ -x /opt/stt/venv/bin/pip ]]; then
+    /opt/stt/venv/bin/pip freeze >"${stage}/pip-freeze.txt" 2>/dev/null || true
+  fi
+  {
+    echo "===== nvidia-smi -q ====="
+    nvidia-smi -q 2>&1 || true
+    echo "===== df -h ====="
+    df -h 2>&1 || true
+    echo "===== mounts ====="
+    cat /proc/mounts 2>/dev/null || true
+    echo "===== cgroup ====="
+    cat /sys/fs/cgroup/memory.events 2>/dev/null || true
+    echo "===== ulimit ====="
+    ulimit -a 2>&1 || true
+  } >"${stage}/system.txt"
+  env | sort >"${stage}/env.txt"
+  if [[ -d "${ws}/logs" ]]; then
+    mkdir -p "${stage}/logs"
+    for log in "${ws}/logs"/*; do
+      [[ -f "$log" ]] || continue
+      tail -n 5000 "$log" >"${stage}/logs/$(basename "$log")" || true
+    done
+  fi
+  if [[ -d "${ws}/simpletuner/config" ]]; then
+    mkdir -p "${stage}/config"
+    find "${ws}/simpletuner/config" -type f -name '*.json' -size -200k -exec cp {} "${stage}/config/" \; 2>/dev/null || true
+  fi
+  python3 "${HERE}/stt-redact.py" "$stage"
+  stamp="$(TZ=Asia/Tokyo date +%Y%m%d-%H%M%S)"
+  zip_path="${ws}/diagnostics/stt-diag-${stamp}-$$.zip"
+  python3 - "$stage" "$zip_path" <<'PY'
+import sys, zipfile
+from pathlib import Path
+stage = Path(sys.argv[1])
+dest = Path(sys.argv[2])
+with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for path in stage.rglob("*"):
+        if path.is_file():
+            zf.write(path, path.relative_to(stage).as_posix())
+PY
+  rm -rf "$stage"
+  echo "診断ファイル / diagnostic zip: ${zip_path}" >&2
+fi
+
+rm -f "$rows"
+if (( fail_count > 0 )); then
+  exit 1
+fi
+exit 0

@@ -204,6 +204,46 @@ docker exec "${CLOSED_NAME}" bash -lc 'curl -sf -o /dev/null http://127.0.0.1:18
   || true
 pass "WEB_PASSWORD missing: start script exits 0, container stays up, GUI is not exposed"
 
+echo "Running helper and doctor tests inside the container"
+docker cp "${ROOT}/scripts/test_helpers.sh" "${NAME}:/tmp/test_helpers.sh"
+docker exec \
+  -e STT_REQUIRE_IMAGE_BIN=1 \
+  -e HF_TOKEN='hf_FAKESECRETTOKENVALUE1234567890' \
+  -e WEB_PASSWORD="${WEB_PASSWORD}" \
+  -e WEB_USERNAME="${WEB_USERNAME}" \
+  "${NAME}" bash /tmp/test_helpers.sh \
+  || fail "helper and doctor tests failed"
+pass "helper and doctor tests inside the container (mocked GPU and HF, secrets redacted)"
+
+echo "Running live stt-doctor against this container"
+docker exec "${NAME}" stt-doctor --json --zip > /tmp/stt-doctor-live.json 2>/tmp/stt-doctor-live.err || true
+python3 - /tmp/stt-doctor-live.json <<'PY' || fail "live stt-doctor proxy checks were not PASS"
+import json, sys
+checks = {row["id"]: row["status"] for row in json.load(open(sys.argv[1]))["checks"]}
+for key in ("S01", "S02", "S03", "A01"):
+    if checks.get(key) != "PASS":
+        raise SystemExit(f"{key}={checks.get(key)}")
+print("live", {k: checks[k] for k in ("S01", "S02", "S03", "A01", "G01", "G03", "M02")})
+PY
+# The running container's password must not show up in the diagnostic zip.
+docker exec "${NAME}" python3 - "${WEB_PASSWORD}" <<'PY' || fail "live diagnostic zip contains WEB_PASSWORD"
+import os, sys, zipfile
+from pathlib import Path
+password = sys.argv[1]
+zips = sorted(Path("/workspace/diagnostics").glob("stt-diag-*.zip"))
+if not zips:
+    raise SystemExit("no diagnostic zip")
+blob = []
+with zipfile.ZipFile(zips[-1]) as zf:
+    for name in zf.namelist():
+        blob.append(zf.read(name).decode("utf-8", errors="replace"))
+text = "\n".join(blob)
+if password and password in text:
+    raise SystemExit("password leaked")
+print("live-zip-ok", zips[-1].name)
+PY
+pass "live stt-doctor proxy checks passed and the zip redacted WEB_PASSWORD"
+
 echo
 echo "==== summary ===="
 echo "image=${IMAGE} variant=${VARIANT}"

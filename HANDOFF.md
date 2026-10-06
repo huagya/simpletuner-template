@@ -79,12 +79,23 @@ gzip -6 of `/opt/stt/venv` in the new cu128 image: **4,675,746,836** bytes. That
 
 ### CI
 
-GitHub's runner table lists **14 GB SSD** for `ubuntu-24.04` / `ubuntu-latest` (public repos, 4 CPU, 16 GB RAM): https://docs.github.com/en/actions/reference/runners/github-hosted-runners . That is the free path. Larger runners are paid. The workflow `.github/workflows/image.yml` deletes the preinstalled dotnet, Android SDK, GHC, Swift, and `AGENT_TOOLSDIRECTORY` before the build and prints `df -h` before and after, so the run log is the measurement for this repo. A published cleanup example measured an 84GB root that went from about 24GB free to about 43GB free after a similar deletion (https://github.com/ultralytics/actions/blob/main/cleanup-disk/README.md). That is their number, not ours, until this workflow runs.
+GitHub's runner table lists **14 GB SSD** for `ubuntu-24.04` / `ubuntu-latest` (public repos, 4 CPU, 16 GB RAM): https://docs.github.com/en/actions/reference/runners/github-hosted-runners . That is the documented free-tier size. The machine that actually ran this workflow was larger. Run `37479631467` on `ubuntu-24.04`, job `smoke`, log:
+
+| | Size | Used | Avail |
+|---|---|---|---|
+| `df` before cleanup | 145G | 59G | 87G |
+| `df` after deleting dotnet, Android, GHC, Swift, JVM, and `AGENT_TOOLSDIRECTORY` | 145G | 23G | 123G |
+
+The cleanup freed about 36GB on that runner. A published example of a similar cleanup measured an 84GB root going from about 24GB free to about 43GB free (https://github.com/ultralytics/actions/blob/main/cleanup-disk/README.md). That is their runner, not this one.
 
 - `pull_request` and `workflow_dispatch`: CPU image, `scripts/smoke_container.sh`, no push.
 - `push` of a `v*` tag: cu128 image, smoke, then push `ghcr.io/huagya/simpletuner-template:<tag>` and `:latest`.
 
 No tag was created and nothing was pushed to GHCR.
+
+Dry run: pull request #3 started the workflow. Job `smoke` finished in 7m16s with success. `Smoke the CPU image` printed `image_bytes=3357065588` and `ALL CHECKS PASSED`. `Smoke the cu128 image` and `Push the version tag to GHCR` were skipped, which is what a non-tag run is supposed to do. Log: https://github.com/huagya/simpletuner-template/actions/runs/37479631467
+
+`workflow_dispatch` from this branch was refused: `HTTP 404: workflow image.yml not found on the default branch`. Dispatch works only after the file is on `main`. The pull request run is the dry run.
 
 ### Smoke (no GPU)
 
@@ -102,7 +113,6 @@ Commands: `sudo STT_TORCH_VARIANT=cpu bash scripts/smoke_container.sh` exit 0, `
 
 ### UNVERIFIED
 
-- The GitHub Actions run itself, until the workflow on this branch finishes. See the dry-run note at the bottom of this section once it has been updated.
 - A real RunPod pull, warm or cold, and whether SSH accepts `PUBLIC_KEY` on their proxy. The script matches their key setup. It was not connected to RunPod.
 - GPU training. `libcuda.so.1` is still supplied by the host.
 - Windows Docker Desktop.

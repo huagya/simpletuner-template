@@ -1,0 +1,7 @@
+# Linux check without a GPU. The Windows start.bat does not use this file.
+# It removes the GPU request from docker-compose.yml so the same image can boot here.
+
+services:
+  simpletuner:
+    gpus: !reset null
+    deploy: !reset null

@@ -1,0 +1,3 @@
+windows/.env
+windows/datasets/*
+!windows/datasets/.gitkeep

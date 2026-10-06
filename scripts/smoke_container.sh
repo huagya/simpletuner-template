@@ -222,7 +222,8 @@ import json, sys
 checks = {row["id"]: row["status"] for row in json.load(open(sys.argv[1]))["checks"]}
 for key in ("S01", "S02", "S03", "A01"):
     if checks.get(key) != "PASS":
-        raise SystemExit(f"{key}={checks.get(key)}")
+        row = next(item for item in json.load(open(sys.argv[1]))["checks"] if item["id"] == key)
+        raise SystemExit(f"{key}={checks.get(key)} {row.get('message')}")
 print("live", {k: checks[k] for k in ("S01", "S02", "S03", "A01", "G01", "G03", "M02")})
 PY
 # The running container's password must not show up in the diagnostic zip.

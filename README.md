@@ -55,6 +55,8 @@ sudo bash scripts/smoke_container.sh
 
 `smoke_container.sh` builds the CPU variant unless `STT_TORCH_VARIANT=cu128`.
 
+On 2026-10-06 the cu128 image was about 30.8GB and the CPU smoke image about 18.1GB (`docker image inspect` Size). The RunPod base layer alone is about 12.7GB, so a GitHub-hosted free runner (~14GB disk) cannot build either variant. Details are in `HANDOFF.md`.
+
 ## License
 
 SimpleTuner is AGPL-3.0-or-later: https://github.com/bghira/SimpleTuner

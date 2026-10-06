@@ -1,6 +1,85 @@
-# Handoff — step 1 (feasibility spike + repo skeleton)
+# Handoff
 
-Date: 2026-10-06. Nothing was published. No GPU was used. No RunPod or Vast instance was started.
+Date: 2026-10-06. Nothing was published to a registry. No GPU was passed through. No RunPod or Vast instance was started.
+
+## Step 2 — the RunPod image boots
+
+### 日本語（短い結論）
+
+- イメージはビルドできた。中身は SimpleTuner 4.9.3 と torch 2.11.0+cu128。GPU のないこの VM でも、パスワード付きの WebUI と Jupyter が起動した。
+- ベースイメージの nginx が 8001 番を先に使っていた。最初の起動では Caddy がポートを取れず、RunPod の 502 案内ページが返った。起動スクリプトで nginx を止めてから Caddy を出すように直した。
+- `WEB_PASSWORD` が無いと、画面は出さず、案内ページだけ出して、コンテナは落ちない。
+- 学習データ用のフォルダは `/workspace` に作り、コンテナを再起動しても残った。
+- cu128 のイメージは約 30.8GB、CPU 版は約 18.1GB。GitHub の無料ランナー（ディスク約 14GB）には、ベースイメージ単体（約 12.7GB）の時点で入りきらない。
+
+### Decisions
+
+11. Keep RunPod's `/start.sh` as PID 1. `/pre_start.sh` only creates `/workspace` and exits 0. `/post_start.sh` runs `/opt/stt/bin/stt-start` and **always exits 0**, because `/start.sh` uses `set -e` and a failing hook skips `sleep infinity`.
+12. Do not set `JUPYTER_PASSWORD` or `JUPYTER_DISABLE_AUTH`. The base start script would otherwise bind Jupyter to `0.0.0.0:8888` before our proxy. JupyterLab 4.5.10 from the base image listens on `127.0.0.1:18888` with an empty token. Caddy on `8888` is the only login.
+13. One password for the GUI and Jupyter. `WEB_USERNAME` defaults to `admin` and must match `[A-Za-z0-9_-]+`. `WEB_PASSWORD` must be at least 12 characters. If it is missing or too short, Caddy serves a static warning page and SimpleTuner and Jupyter are not started.
+14. Do not call `simpletuner auth setup`.
+15. Public ports are Caddy `8001` (GUI) and `8888` (Jupyter). The app binds `127.0.0.1:18001` and `127.0.0.1:18888`. Override with `STT_GUI_PORT`, `STT_JUPYTER_PORT`, `STT_APP_PORT`, `STT_JUPYTER_APP_PORT` so a later Windows compose file can move them.
+16. Stop the base image's nginx before Caddy starts. Its config listens on `8001` as a placeholder for code-server (`proxy_pass` to `localhost:8000`). `service nginx stop` is a no-op when nginx is absent.
+17. Caddy site addresses are `http://:8001` and `http://:8888` with `bind 0.0.0.0`. `http://0.0.0.0:8001` is a hostname match, not a bind. The bcrypt hash is written into the Caddyfile with `caddy hash-password` (mode 600). `{$WEB_PASSWORD_HASH}` is still unused.
+18. Data layout on `/workspace`: `huggingface` (`HF_HOME`), `models`, `datasets`, `simpletuner/config`, `simpletuner/output`, `simpletuner/.state`, `logs`, `.cache/torchinductor`, `.cache/triton`. This overrides the base image default `HF_HOME=/workspace/.cache/huggingface/`. The same paths are exported on the SimpleTuner process and appended for later root shells via `/etc/profile.d/stt.sh`.
+19. RunPod env vars are optional. With `RUNPOD_POD_ID` unset, the banner prints `http://localhost:8001` and `http://localhost:8888`. `STT_GUI_URL` and `STT_JUPYTER_URL` override the printed URLs. No Windows compose file in this step.
+20. Dependencies are installed only at build time from `locks/cu128.txt` or `locks/cpu.txt` (`uv pip sync`, hashes, `--index-strategy unsafe-best-match` because the PyTorch extra index publishes an old `requests`). Default `TORCH_VARIANT` is `cu128`. Container start does not run pip. SimpleTuner is retried up to 5 times and then left stopped; the pod stays up.
+21. Jupyter is not duplicated into the venv. The base image already has `jupyterlab==4.5.10`.
+
+### Image size
+
+| Image | `docker image inspect` Size | What it is |
+|---|---|---|
+| `runpod/base@sha256:e6eb5a38…` | 12,694,186,412 bytes (~12.7GB) | Pulled digest. Shared by both builds. |
+| `stt-runpod:smoke-cpu` | 18,063,304,171 bytes (~18.1GB) | Base plus ~5.4GB app layer (CPU torch). |
+| `stt-runpod:cu128` | 30,840,988,478 bytes (~30.8GB) | Default image. Base plus the cu128 lock (torch wheel, `nvidia-*-cu12`, deepspeed, bitsandbytes). |
+
+GitHub-hosted free runners have about 14GB of disk. The base image alone is ~12.7GB uncompressed, so a job that pulls it and then builds either variant will not fit. That is a later CI-publishing problem, not a reason to drop cu128 from the Dockerfile default.
+
+`/opt/stt/build-info.json` in the cu128 image: `simpletuner 4.9.3`, `torch 2.11.0+cu128`, `torch_cuda 12.8`. The CPU image: `torch 2.11.0+cpu`, `torch_cuda null`.
+
+### Verified on this VM (no GPU)
+
+Docker: 29.1.3 with BuildKit (`docker-buildx` 0.30.1) and storage driver `fuse-overlayfs`. Commands:
+
+- `sudo docker build --build-arg TORCH_VARIANT=cpu -t stt-runpod:smoke-cpu .` — exit 0.
+- `sudo docker build --build-arg TORCH_VARIANT=cu128 -t stt-runpod:cu128 .` — exit 0.
+- `sudo bash scripts/smoke_container.sh` — exit 0, `ALL CHECKS PASSED`, `image_bytes=18063304171`.
+- `sudo STT_TORCH_VARIANT=cu128 bash scripts/smoke_container.sh` — exit 0, `ALL CHECKS PASSED`, `image_bytes=30840988478`.
+
+| Check | CPU smoke | cu128 smoke | Evidence |
+|---|---|---|---|
+| Image builds, no pip at start | **PASS** | **PASS** | Both builds exit 0. Start logs show numbered steps and no pip. `build-info.json` matches the pins above. |
+| Unauthenticated GUI is 401 | **PASS** | **PASS** | Script: `PASS: unauthenticated GUI request gets 401`. |
+| Authenticated GUI is 200 | **PASS** | **PASS** | Script: `PASS: authenticated GUI page is HTTP 200 and is the SimpleTuner trainer`. Saved HTML title: `SimpleTuner Training Studio`. |
+| Unauthenticated Jupyter is 401 | **PASS** | **PASS** | Script: `PASS: unauthenticated Jupyter request gets 401`. |
+| Authenticated Jupyter is 200 | **PASS** | **PASS** | Script: `PASS: authenticated Jupyter page is HTTP 200`. Saved HTML title: `JupyterLab`. |
+| SSE through the proxy | **PASS** | **PASS** | `GET /api/events` body started with `event: connection` / `data: {"type": "connected", "message": "Connected to SimpleTuner"}`. |
+| `WEB_PASSWORD` unset exits gracefully and does not expose the GUI | **PASS** | **PASS** | Script: `PASS: WEB_PASSWORD missing: start script exits 0, container stays up, GUI is not exposed`. Requires log line `forcing exit 0`, body marker `STT_PASSWORD_REQUIRED`, and no listener on `127.0.0.1:18001`. |
+| Data dirs land in `/workspace` and the server env matches | **PASS** | **PASS** | Script checks `huggingface`, `models`, `datasets`, `simpletuner/config`, `simpletuner/output`, `simpletuner/.state`, `.stt-layout-version`, and the SimpleTuner process env (`HF_HOME`, `SIMPLETUNER_CONFIG_DIR`, `SIMPLETUNER_STATE_DIR`). |
+| Restart keeps `/workspace` data | **PASS** | **PASS** | Script writes `/workspace/datasets/smoke-marker.txt`, `docker restart`s, waits for GUI 200, reads the marker back. |
+| Starts with no RunPod env vars | **PASS** | **PASS** | Container log: `detecting platform …… local`. Banner: `http://localhost:8001` and `http://localhost:8888`. Base `/start.sh` reached `sleep infinity` (`Pod is ready to use`). |
+| Real GPU training, RunPod proxy URL, Windows Docker Desktop | **UNVERIFIED** | **UNVERIFIED** | Not run. See below. |
+
+An earlier CPU container log (before the nginx fix was retested) showed `[stt 7/7] … ready in 24 s` with no GPU. The green cu128 smoke also returned the trainer page inside the 180s wait. Exact cu128 startup milliseconds were not captured.
+
+### Failures
+
+1. This VM's first dockerd (containerd snapshotter + overlayfs) could not extract the base image: `failed to convert whiteout file … operation not permitted` (`mknod` of a whiteout returns EPERM). `hello-world` and `ubuntu:24.04` pulled. Restarted dockerd with `--storage-driver fuse-overlayfs --feature containerd-snapshotter=false --data-root /var/lib/docker-fuse`. The digest then pulled. This is a limitation of this VM, not of the Dockerfile.
+2. `docker build` failed immediately with `BuildKit is enabled but the buildx component is missing`. Installed `docker-buildx` 0.30.1. The Dockerfile uses `RUN --mount=type=cache`, so BuildKit is required. Docker Desktop and GitHub Actions builders have it.
+3. First CPU smoke (image `18063303559`, container `stt-smoke-cpu-14572`) never got a 401. Host `curl` to `127.0.0.1:18081/web/trainer` was HTTP 200 from `nginx/1.24.0` with title `502 | README | Runpod`. Caddy's log: `listening on :8001: listen tcp :8001: bind: address already in use`. `ss` showed nginx on `0.0.0.0:8001` and SimpleTuner already on `127.0.0.1:18001`. Fixed in `image/stt-start` by stopping nginx and binding Caddy with `http://:port`. The smoke script was killed and rerun. Both later runs exited 0.
+
+### UNVERIFIED after step 2
+
+- Boot on a real RunPod pod, including `https://$RUNPOD_POD_ID-8001.proxy.runpod.net` and the 100s Cloudflare timeout.
+- NVIDIA driver ≥ 570, `nvidia-smi`, and any training step. Both smokes logged `WARN GPU が見えません`.
+- Windows Docker Desktop (WSL2, RTX 4060 Ti). The image does not require RunPod variables, and the same start path ran on Linux Docker. Nobody has run it on Windows yet. No compose file and no `.bat`.
+- Vast.ai image.
+- A GitHub Actions build or push. Estimated size above.
+- `{$WEB_PASSWORD_HASH}` as a Caddy env placeholder. The hash is inlined instead.
+- Which PixArt id the GUI dropdown writes (`pixart` vs `pixart_sigma`). Not part of this step.
+
+## Step 1 — feasibility spike + repo skeleton
 
 ## 日本語（短い結論）
 

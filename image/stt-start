@@ -133,13 +133,27 @@ fi
 
 log "[stt 5/7] Hugging Face トークン / HF token … ${hf_note} (login helper is not in this image)"
 
+# The RunPod base image starts nginx, and its config listens on 8001 as a
+# placeholder for code-server. That is the public GUI port. Stop nginx so
+# Caddy can bind it. Other platforms that do not ship nginx are unaffected.
+free_public_ports() {
+  if command -v service >/dev/null 2>&1; then
+    service nginx stop >/dev/null 2>&1 || true
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -s quit >/dev/null 2>&1 || true
+  fi
+  log "[stt 6/7] 公開ポートを空ける / freeing public ports … nginx stopped if it was running (base image listens on ${GUI_PORT})"
+}
+
 write_closed_caddy() {
   cat > /opt/stt/Caddyfile <<EOF
 {
 	admin off
 	auto_https off
 }
-http://0.0.0.0:${GUI_PORT}, http://0.0.0.0:${JUP_PORT} {
+http://:${GUI_PORT}, http://:${JUP_PORT} {
+	bind 0.0.0.0
 	root * /opt/stt/share/no-password
 	file_server
 }
@@ -154,7 +168,8 @@ write_open_caddy() {
 	admin off
 	auto_https off
 }
-http://0.0.0.0:${GUI_PORT} {
+http://:${GUI_PORT} {
+	bind 0.0.0.0
 	basic_auth {
 		${WEB_USERNAME} "${hash}"
 	}
@@ -162,7 +177,8 @@ http://0.0.0.0:${GUI_PORT} {
 		flush_interval -1
 	}
 }
-http://0.0.0.0:${JUP_PORT} {
+http://:${JUP_PORT} {
+	bind 0.0.0.0
 	basic_auth {
 		${WEB_USERNAME} "${hash}"
 	}
@@ -182,6 +198,8 @@ start_caddy() {
     >> "${WORKSPACE}/logs/caddy.log" 2>&1 &
   echo $! > /opt/stt/run/caddy.pid 2>/dev/null || true
 }
+
+free_public_ports
 
 if [[ "${password_ok}" -ne 1 ]]; then
   log "[stt 6/7] サービス起動 / starting services … Caddy warning page only. SimpleTuner と Jupyter は起動しません / not started"

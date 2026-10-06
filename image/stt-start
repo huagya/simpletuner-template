@@ -1,0 +1,287 @@
+#!/bin/bash
+# Boot SimpleTuner, Caddy, and Jupyter. Never exits non-zero: a dead pod
+# cannot be debugged from the RunPod console. /post_start.sh also forces 0.
+set +e
+finished=0
+finish() {
+  if [[ "${finished}" -eq 0 ]]; then
+    finished=1
+    echo "[stt] finished / 終了 exit=0"
+  fi
+}
+trap finish EXIT
+
+LOG_FILE=""
+log() {
+  echo "$*"
+  if [[ -n "${LOG_FILE}" ]]; then
+    echo "$*" >> "${LOG_FILE}" 2>/dev/null || true
+  fi
+}
+
+GUI_PORT="${STT_GUI_PORT:-8001}"
+JUP_PORT="${STT_JUPYTER_PORT:-8888}"
+APP_PORT="${STT_APP_PORT:-18001}"
+JUP_APP_PORT="${STT_JUPYTER_APP_PORT:-18888}"
+WEB_USERNAME="${WEB_USERNAME:-admin}"
+WORKSPACE="${STT_WORKSPACE_ROOT:-/workspace}"
+
+if [[ -n "${RUNPOD_POD_ID:-}" ]]; then
+  PLATFORM="RunPod (pod ${RUNPOD_POD_ID})"
+  GUI_URL="https://${RUNPOD_POD_ID}-${GUI_PORT}.proxy.runpod.net"
+  JUP_URL="https://${RUNPOD_POD_ID}-${JUP_PORT}.proxy.runpod.net"
+else
+  PLATFORM="local"
+  GUI_URL="http://localhost:${GUI_PORT}"
+  JUP_URL="http://localhost:${JUP_PORT}"
+fi
+if [[ -n "${STT_GUI_URL:-}" ]]; then
+  GUI_URL="${STT_GUI_URL}"
+fi
+if [[ -n "${STT_JUPYTER_URL:-}" ]]; then
+  JUP_URL="${STT_JUPYTER_URL}"
+fi
+
+mkdir -p /opt/stt/run "${WORKSPACE}/logs" 2>/dev/null || true
+if [[ -d "${WORKSPACE}/logs" && -w "${WORKSPACE}/logs" ]]; then
+  LOG_FILE="${WORKSPACE}/logs/start-$(date +%Y%m%d-%H%M%S).log"
+  : > "${LOG_FILE}" 2>/dev/null || LOG_FILE=""
+fi
+
+VARIANT="unknown"
+if [[ -f /opt/stt/build-info.json ]]; then
+  VARIANT="$(/opt/stt/venv/bin/python -c 'import json; print(json.load(open("/opt/stt/build-info.json")).get("torch","unknown"))' 2>/dev/null || echo unknown)"
+fi
+
+log "[stt 1/7] 環境を確認 / detecting platform …… ${PLATFORM} | torch ${VARIANT}"
+log "[stt 1/7] RunPod 専用の環境変数は不要です / RunPod-only env vars are optional"
+
+password_ok=0
+password_reason=""
+if [[ -z "${WEB_PASSWORD:-}" ]]; then
+  password_reason="unset"
+elif [[ "${#WEB_PASSWORD}" -lt 12 ]]; then
+  password_reason="shorter than 12 characters (${#WEB_PASSWORD})"
+elif [[ ! "${WEB_USERNAME}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  password_reason="WEB_USERNAME must match [A-Za-z0-9_-]+"
+else
+  password_ok=1
+fi
+
+if [[ "${password_ok}" -eq 1 ]]; then
+  log "[stt 2/7] 設定値チェック / validating env … WEB_PASSWORD: set(${#WEB_PASSWORD} chars) user=${WEB_USERNAME}"
+else
+  log "[stt 2/7] 設定値チェック / validating env … WEB_PASSWORD: NOT usable (${password_reason}). GUI は公開しません / GUI will not be exposed"
+fi
+
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  hf_note="set(${#HF_TOKEN} chars)"
+else
+  hf_note="not set"
+fi
+
+mkdir -p \
+  "${WORKSPACE}/huggingface" \
+  "${WORKSPACE}/models" \
+  "${WORKSPACE}/datasets" \
+  "${WORKSPACE}/simpletuner/config" \
+  "${WORKSPACE}/simpletuner/output" \
+  "${WORKSPACE}/simpletuner/.state" \
+  "${WORKSPACE}/logs" \
+  "${WORKSPACE}/.cache/torchinductor" \
+  "${WORKSPACE}/.cache/triton" \
+  2>/dev/null
+layout_rc=$?
+if [[ "${layout_rc}" -eq 0 ]]; then
+  echo "1" > "${WORKSPACE}/.stt-layout-version" 2>/dev/null || true
+  log "[stt 3/7] フォルダ準備 / preparing ${WORKSPACE} … ok (huggingface, models, datasets, simpletuner/config, simpletuner/output, simpletuner/.state)"
+else
+  log "[stt 3/7] フォルダ準備 / preparing ${WORKSPACE} … WARN mkdir failed. 続行します / continuing"
+fi
+
+export HF_HOME="${WORKSPACE}/huggingface"
+export SIMPLETUNER_WORKSPACE="${WORKSPACE}/simpletuner"
+export SIMPLETUNER_CONFIG_DIR="${WORKSPACE}/simpletuner/config"
+export SIMPLETUNER_STATE_DIR="${WORKSPACE}/simpletuner/.state"
+export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/.cache/torchinductor"
+export TRITON_CACHE_DIR="${WORKSPACE}/.cache/triton"
+export HF_HUB_DISABLE_TELEMETRY=1
+
+# New shells should see the same paths. Appended after RunPod's rp_environment
+# source line, which /start.sh adds before this script runs.
+profile=/etc/profile.d/stt.sh
+cat > "${profile}" <<EOF
+export HF_HOME=${WORKSPACE}/huggingface
+export SIMPLETUNER_WORKSPACE=${WORKSPACE}/simpletuner
+export SIMPLETUNER_CONFIG_DIR=${WORKSPACE}/simpletuner/config
+export SIMPLETUNER_STATE_DIR=${WORKSPACE}/simpletuner/.state
+export TORCHINDUCTOR_CACHE_DIR=${WORKSPACE}/.cache/torchinductor
+export TRITON_CACHE_DIR=${WORKSPACE}/.cache/triton
+export PATH="/opt/stt/bin:/opt/stt/venv/bin:\${PATH}"
+EOF
+chmod 644 "${profile}" 2>/dev/null || true
+if [[ -f /root/.bashrc ]] && ! grep -q 'profile.d/stt.sh' /root/.bashrc 2>/dev/null; then
+  echo 'source /etc/profile.d/stt.sh' >> /root/.bashrc || true
+fi
+
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  gpu_line="$(nvidia-smi -L 2>/dev/null | head -n 1)"
+  log "[stt 4/7] GPU 簡易チェック / quick GPU check … ${gpu_line}"
+else
+  log "[stt 4/7] GPU 簡易チェック / quick GPU check … WARN GPU が見えません / no GPU visible. Continuing (CPU or toolkit not passed through)."
+fi
+
+log "[stt 5/7] Hugging Face トークン / HF token … ${hf_note} (login helper is not in this image)"
+
+# The RunPod base image starts nginx, and its config listens on 8001 as a
+# placeholder for code-server. That is the public GUI port. Stop nginx so
+# Caddy can bind it. Other platforms that do not ship nginx are unaffected.
+free_public_ports() {
+  if command -v service >/dev/null 2>&1; then
+    service nginx stop >/dev/null 2>&1 || true
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -s quit >/dev/null 2>&1 || true
+  fi
+  log "[stt 6/7] 公開ポートを空ける / freeing public ports … nginx stopped if it was running (base image listens on ${GUI_PORT})"
+}
+
+write_closed_caddy() {
+  cat > /opt/stt/Caddyfile <<EOF
+{
+	admin off
+	auto_https off
+}
+http://:${GUI_PORT}, http://:${JUP_PORT} {
+	bind 0.0.0.0
+	root * /opt/stt/share/no-password
+	file_server
+}
+EOF
+}
+
+write_open_caddy() {
+  local hash="$1"
+  umask 077
+  cat > /opt/stt/Caddyfile <<EOF
+{
+	admin off
+	auto_https off
+}
+http://:${GUI_PORT} {
+	bind 0.0.0.0
+	basic_auth {
+		${WEB_USERNAME} "${hash}"
+	}
+	reverse_proxy 127.0.0.1:${APP_PORT} {
+		flush_interval -1
+	}
+}
+http://:${JUP_PORT} {
+	bind 0.0.0.0
+	basic_auth {
+		${WEB_USERNAME} "${hash}"
+	}
+	reverse_proxy 127.0.0.1:${JUP_APP_PORT} {
+		flush_interval -1
+	}
+}
+EOF
+  chmod 600 /opt/stt/Caddyfile || true
+}
+
+start_caddy() {
+  if [[ -f "${WORKSPACE}/logs/caddy.log" ]]; then
+    :
+  fi
+  nohup /opt/stt/bin/caddy run --config /opt/stt/Caddyfile --adapter caddyfile \
+    >> "${WORKSPACE}/logs/caddy.log" 2>&1 &
+  echo $! > /opt/stt/run/caddy.pid 2>/dev/null || true
+}
+
+free_public_ports
+
+if [[ "${password_ok}" -ne 1 ]]; then
+  log "[stt 6/7] サービス起動 / starting services … Caddy warning page only. SimpleTuner と Jupyter は起動しません / not started"
+  write_closed_caddy
+  start_caddy
+  log "[stt 7/7] 起動待ち / waiting for WebUI … skipped (GUI closed)"
+  log "============================================================"
+  log " GUI は公開していません / GUI is not exposed"
+  log " WEB_PASSWORD を 12 文字以上で設定して再起動してください"
+  log " Set WEB_PASSWORD (12+ characters) and restart."
+  log " ログ / logs: ${WORKSPACE}/logs"
+  log "============================================================"
+  exit 0
+fi
+
+hash="$(/opt/stt/bin/caddy hash-password --plaintext "${WEB_PASSWORD}" 2>/dev/null || true)"
+if [[ -z "${hash}" ]]; then
+  log "[stt 6/7] サービス起動 / starting services … WARN caddy hash-password failed. GUI は公開しません / not exposing GUI"
+  write_closed_caddy
+  start_caddy
+  log "[stt 7/7] 起動待ち / waiting for WebUI … skipped"
+  exit 0
+fi
+write_open_caddy "${hash}"
+
+log "[stt 6/7] サービス起動 / starting services … simpletuner 127.0.0.1:${APP_PORT}, jupyter 127.0.0.1:${JUP_APP_PORT}, caddy :${GUI_PORT}/:${JUP_PORT}"
+
+cat > /opt/stt/run/simpletuner-loop.sh <<EOS
+#!/bin/bash
+cd "${WORKSPACE}/logs" || cd /tmp || true
+i=0
+while [[ "\${i}" -lt 5 ]]; do
+  i=\$((i + 1))
+  echo "simpletuner attempt \${i}"
+  /opt/stt/venv/bin/simpletuner server --host 127.0.0.1 --port ${APP_PORT}
+  echo "simpletuner exited \$?"
+  sleep 2
+done
+echo "simpletuner stopped after \${i} attempts"
+EOS
+chmod 755 /opt/stt/run/simpletuner-loop.sh
+nohup /opt/stt/run/simpletuner-loop.sh >> "${WORKSPACE}/logs/simpletuner.log" 2>&1 &
+echo $! > /opt/stt/run/simpletuner.pid 2>/dev/null || true
+
+if [[ -x /usr/local/bin/jupyter ]]; then
+  nohup /usr/local/bin/jupyter lab --config=/opt/stt/share/jupyter_server_config.py \
+    --port="${JUP_APP_PORT}" --ip=127.0.0.1 \
+    >> "${WORKSPACE}/logs/jupyter.log" 2>&1 &
+  echo $! > /opt/stt/run/jupyter.pid 2>/dev/null || true
+else
+  log "[stt 6/7] WARN jupyter が見つかりません / jupyter binary not found"
+fi
+
+start_caddy
+
+log "[stt 7/7] 起動待ち / waiting for WebUI …"
+ready=0
+start_s="$(date +%s)"
+for _ in $(seq 1 180); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_PORT}/web/trainer" || true)"
+  if [[ "${code}" == "200" ]]; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+end_s="$(date +%s)"
+if [[ "${ready}" -eq 1 ]]; then
+  log "[stt 7/7] 起動待ち / waiting for WebUI … ready in $((end_s - start_s)) s"
+else
+  log "[stt 7/7] 起動待ち / waiting for WebUI … WARN not ready after 180 s. ポッドは落とさない / pod stays up"
+  if [[ -f "${WORKSPACE}/logs/simpletuner.log" ]]; then
+    log "----- last 30 lines of simpletuner.log -----"
+    tail -n 30 "${WORKSPACE}/logs/simpletuner.log" 2>/dev/null | while IFS= read -r line; do
+      log "${line}"
+    done
+  fi
+fi
+
+log "============================================================"
+log " SimpleTuner WebUI : ${GUI_URL}   (user: ${WEB_USERNAME})"
+log " JupyterLab        : ${JUP_URL}"
+log " ログ / logs       : ${WORKSPACE}/logs"
+log "============================================================"
+exit 0

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>WEB_PASSWORD が必要です / WEB_PASSWORD required</title>
+</head>
+<body>
+  <h1>GUI は公開していません / The GUI is not exposed</h1>
+  <p id="stt-password-required">STT_PASSWORD_REQUIRED</p>
+  <p>
+    WEB_PASSWORD が未設定か、12 文字未満です。テンプレート（または docker run -e）で
+    12 文字以上の WEB_PASSWORD を設定して、コンテナを再起動してください。
+  </p>
+  <p>
+    WEB_PASSWORD is unset or shorter than 12 characters. Set WEB_PASSWORD to at
+    least 12 characters and restart the container. SimpleTuner and Jupyter are
+    not proxied until then.
+  </p>
+</body>
+</html>

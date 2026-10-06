@@ -244,8 +244,15 @@ chmod 755 /opt/stt/run/simpletuner-loop.sh
 nohup /opt/stt/run/simpletuner-loop.sh >> "${WORKSPACE}/logs/simpletuner.log" 2>&1 &
 echo $! > /opt/stt/run/simpletuner.pid 2>/dev/null || true
 
-if [[ -x /usr/local/bin/jupyter ]]; then
-  nohup /usr/local/bin/jupyter lab --config=/opt/stt/share/jupyter_server_config.py \
+JUPYTER_BIN=""
+for candidate in /opt/stt/venv/bin/jupyter /usr/local/bin/jupyter; do
+  if [[ -x "${candidate}" ]]; then
+    JUPYTER_BIN="${candidate}"
+    break
+  fi
+done
+if [[ -n "${JUPYTER_BIN}" ]]; then
+  nohup "${JUPYTER_BIN}" lab --config=/opt/stt/share/jupyter_server_config.py \
     --port="${JUP_APP_PORT}" --ip=127.0.0.1 \
     >> "${WORKSPACE}/logs/jupyter.log" 2>&1 &
   echo $! > /opt/stt/run/jupyter.pid 2>/dev/null || true
